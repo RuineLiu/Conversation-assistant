@@ -1,0 +1,11 @@
+accept: 2.0
+helpfulness: 1.5
+task_progress: 1.0
+timing_fit: 0.8
+content_fit: 0.5
+annoyance: -2.5
+flow_break: -2.0
+redundancy: -1.5
+privacy_risk: -1.2
+cognitive_load: -0.8
+latency_penalty: -0.5
