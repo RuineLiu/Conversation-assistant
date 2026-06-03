@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>2D Sandbox Viewer</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage-shell" aria-label="Conference room sandbox">
+        <div class="stage-toolbar">
+          <div>
+            <p class="eyebrow">2D Sandbox</p>
+            <h1>Conference Room Simulation</h1>
+          </div>
+          <div class="status-pill" id="connection-status">Connecting</div>
+        </div>
+        <div id="game-root" class="game-root"></div>
+      </section>
+
+      <aside class="side-panel" aria-label="Simulation controls">
+        <section class="panel-section control-section">
+          <div class="panel-heading">
+            <h2>Controls</h2>
+            <span id="tick-counter">Tick 0</span>
+          </div>
+          <div class="button-grid">
+            <button id="step-once" type="button">Step</button>
+            <button id="step-five" type="button">Step x5</button>
+            <button id="demo-actions" type="button">Demo Actions</button>
+          </div>
+          <form id="instruction-form" class="instruction-form">
+            <label for="instruction-input">Instruction</label>
+            <div class="instruction-row">
+              <input id="instruction-input" type="text" placeholder="Ask agents to prepare the meeting" />
+              <button type="submit">Send</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel-section">
+          <div class="panel-heading">
+            <h2>Agents</h2>
+            <span id="agent-count">0</span>
+          </div>
+          <div id="agent-list" class="agent-list"></div>
+        </section>
+
+        <section class="panel-section">
+          <div class="panel-heading">
+            <h2>Objects</h2>
+            <span id="object-count">0</span>
+          </div>
+          <div id="object-list" class="object-list"></div>
+        </section>
+
+        <section class="panel-section log-section">
+          <div class="panel-heading">
+            <h2>Recent Events</h2>
+            <span id="event-count">0</span>
+          </div>
+          <div id="event-list" class="event-list"></div>
+        </section>
+      </aside>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
