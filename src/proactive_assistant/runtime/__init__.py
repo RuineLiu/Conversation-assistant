@@ -19,6 +19,8 @@ from proactive_assistant.runtime.store import (
     DecisionRecordNotFoundError,
     InMemoryRuntimeStore,
     RuntimeFeedbackEventAlreadyExistsError,
+    RuntimeRepository,
+    RuntimeStore,
     RuntimeStoreError,
 )
 
@@ -40,5 +42,7 @@ __all__ = [
     "RewardObservation",
     "RuntimeFeedbackEvent",
     "RuntimeFeedbackEventAlreadyExistsError",
+    "RuntimeRepository",
+    "RuntimeStore",
     "RuntimeStoreError",
 ]

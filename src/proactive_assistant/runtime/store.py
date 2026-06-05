@@ -1,3 +1,5 @@
+from typing import Protocol, runtime_checkable
+
 from proactive_assistant.runtime.contracts import (
     MemoryCandidate,
     PromptDecisionRecord,
@@ -20,6 +22,47 @@ class DecisionRecordAlreadyExistsError(RuntimeStoreError):
 
 class RuntimeFeedbackEventAlreadyExistsError(RuntimeStoreError):
     """Raised when a feedback event id is inserted twice."""
+
+
+@runtime_checkable
+class RuntimeRepository(Protocol):
+    """Repository contract for runtime prompt decisions, feedback, rewards, and memory candidates."""
+
+    def add_decision(self, decision: PromptDecisionRecord) -> PromptDecisionRecord: ...
+
+    def get_decision(self, decision_id: str) -> PromptDecisionRecord: ...
+
+    def list_decisions(self, *, session_id: str | None = None) -> list[PromptDecisionRecord]: ...
+
+    def add_feedback_event(self, event: RuntimeFeedbackEvent) -> RuntimeFeedbackEvent: ...
+
+    def list_feedback_events(
+        self,
+        *,
+        decision_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[RuntimeFeedbackEvent]: ...
+
+    def add_reward_observation(self, observation: RewardObservation) -> RewardObservation: ...
+
+    def list_reward_observations(
+        self,
+        *,
+        decision_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[RewardObservation]: ...
+
+    def add_memory_candidate(self, candidate: MemoryCandidate) -> MemoryCandidate: ...
+
+    def list_memory_candidates(
+        self,
+        *,
+        decision_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[MemoryCandidate]: ...
+
+
+RuntimeStore = RuntimeRepository
 
 
 class InMemoryRuntimeStore:

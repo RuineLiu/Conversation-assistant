@@ -1,6 +1,7 @@
 from typing import Any
 
 from proactive_assistant.meeting_state import MeetingGapType
+from proactive_assistant.memory import MemoryQuery, MemoryRetrievalIntent
 from proactive_assistant.model_gateway import FakeModelClient, ModelRequest
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptOrchestrator
@@ -127,6 +128,39 @@ def test_product_feedback_flow_computes_reward_and_memory_candidate() -> None:
     assert len(feedback.memories) == 1
     assert feedback.memories[0].write_status == "pending_confirmation"
     assert service.list_memory_candidates(decision_id=decision_id) == feedback.memory_candidates
+
+
+def test_product_flow_writes_meeting_state_snapshot_memory_once_and_supports_exact_lookup() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(
+        SessionConfig(
+            title="Customer pricing sync",
+            metadata={"org_id": "org_001", "subject_user_id": "user_001"},
+        ),
+        session_id="session_001",
+    )
+    service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("张三负责客户报价确认，下周五截止。"),
+        segment_id="seg_0",
+    )
+
+    snapshot = service.write_meeting_state_memory_snapshot(session.session_id)
+    duplicate_snapshot = service.write_meeting_state_memory_snapshot(session.session_id)
+    stored = service.memory.store.list_memories(MemoryQuery(session_id=session.session_id, include_pending=True, limit=20))
+    context = service.search_memory_context_for_session(
+        session.session_id,
+        query_text="之前这个 deadline 是什么时候？",
+        include_pending=True,
+    )
+
+    assert snapshot.committed is True
+    assert any(candidate.candidate_type == MemoryCandidateType.ACTION_ITEM for candidate in snapshot.memory_candidates)
+    assert len(duplicate_snapshot.memories) == len(snapshot.memories)
+    assert len({memory.memory_id for memory in stored}) == len(stored)
+    assert any(memory.metadata["meeting_state_object_type"] == "action_item" for memory in snapshot.memories)
+    assert context.memory_refs
+    assert context.results[0].intent == MemoryRetrievalIntent.LOOKUP_DEADLINE.value
 
 
 def test_product_feedback_can_skip_reward_and_memory_generation() -> None:

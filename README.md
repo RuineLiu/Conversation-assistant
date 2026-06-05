@@ -50,6 +50,10 @@ src/proactive_assistant/prompting/
 src/proactive_assistant/product/
   contracts.py
   service.py
+src/proactive_assistant/persistence/
+  sqlite.py
+src/proactive_assistant/repositories/
+  __init__.py
 src/proactive_assistant/runtime/
   contracts.py
   service.py
@@ -287,7 +291,44 @@ service.append_transcript(
 prompt_request = service.build_prompt_generation_request(session.session_id)
 ```
 
-The session layer reserves `memory_context` and `memory_refs` in `SessionContextSnapshot`, but the actual memory system will be implemented as a later module.
+The session layer carries `memory_context` and `memory_refs` in `SessionContextSnapshot`; the product flow can now populate them through `MemoryService` retrieval.
+
+## Repository Interfaces
+
+Persistence boundaries are defined by explicit repository protocols, not by a generic ORM-style repository. Business services depend on these protocols while current tests and local flows use in-memory implementations.
+
+```text
+SessionRepository   sessions and transcript segments
+RuntimeRepository   prompt decisions, feedback, rewards, memory candidates
+MemoryRepository    long-term memory records and deterministic retrieval
+```
+
+The legacy `SessionStore`, `RuntimeStore`, and `MemoryStore` names remain as compatibility aliases for the same protocols. The in-memory implementations satisfy the repository contracts:
+
+```text
+InMemorySessionStore  -> SessionRepository
+InMemoryRuntimeStore  -> RuntimeRepository
+InMemoryMemoryStore   -> MemoryRepository
+```
+
+SQLite persistence implements these protocols without changing `SessionService`, `PromptRuntimeService`, `MemoryService`, or `ProductAssistantService`.
+
+## SQLite Persistence V0
+
+`src/proactive_assistant/persistence/sqlite.py` provides a local SQLite backend for product experiments that need durable sessions, transcripts, prompt decisions, feedback, rewards, memory candidates, and memory records.
+
+It uses JSON-first storage: each table stores indexed columns for common filters plus the full validated Pydantic payload. This keeps v0 close to the current contracts while leaving room to normalize hot fields later.
+
+To run the Product Backend API with SQLite persistence:
+
+```bash
+export PROACTIVE_STORAGE_BACKEND=sqlite
+export PROACTIVE_SQLITE_PATH=data/local/proactive.db
+
+uv run uvicorn proactive_assistant.product.api:app --reload --port 8001
+```
+
+If `PROACTIVE_STORAGE_BACKEND` is unset, the API keeps using in-memory stores for local smoke tests and unit tests.
 
 ## Memory Core
 
@@ -344,7 +385,39 @@ NEEDS_CONFIRMATION   -> pending_confirmation memory
 BLOCKED              -> rejected memory
 ```
 
+Memory write path consolidation v1 turns feedback-generated `MemoryCandidate` objects into retrieval-ready `MemoryRecord` metadata. It preserves raw candidate text and upstream structured fields, then fills missing deterministic fields when possible:
+
+```text
+owner / assignee
+deadline / normalized_deadline
+status
+entity / canonical_entity / normalized_entity
+prompt_category / prd_surface / display mode / duration policy
+source refs / provenance
+feedback_affinity
+memory_schema_version = memory_consolidation_v1
+```
+
+The write path never overwrites explicit structured metadata supplied by upstream modules. These normalized fields are what enable retrieval v1 to answer exact owner/deadline/status lookups without relying only on keyword overlap.
+
+Meeting state snapshot memory writing v1 can turn the current `MeetingState` into memory candidates and optionally commit them. It currently exports action items, decisions, risks, and tracked gaps. This path is explicit rather than automatic: product callers trigger it through the service or API when a session reaches a checkpoint such as meeting end.
+
 The first retrieval implementation is deterministic. It filters by org, user, session visibility, type, scope, privacy level, source ids, tags, and write status, then ranks by keyword overlap, importance, confidence, and recency. It does not call an embedding model, vector database, or LLM yet.
+
+Memory retrieval v1 adds an explainable deterministic ranker on top of the same store contract:
+
+```text
+query + prompt category + meeting context
+-> target entity resolution from active meeting entities
+-> intent classification
+-> exact lookup path for deadline / owner / status
+-> open recall path for rationale and general context
+-> normalized ranking features
+-> diversity filtering
+-> use_policy for prompt context, policy hints, or ref-only privacy handling
+```
+
+Exact lookup is intentionally conservative: weak target matches become `display_ref_only` or no recall instead of fabricating a deadline, owner, or status. High-privacy memories on glasses surfaces are also returned as references only, not as full text context.
 
 Minimal usage:
 
@@ -610,6 +683,7 @@ POST /sessions/{session_id}/transcript
 GET  /sessions/{session_id}/meeting-state
 GET  /sessions/{session_id}/memory-candidates
 GET  /sessions/{session_id}/memory-context
+POST /sessions/{session_id}/memory-snapshot
 GET  /sessions/{session_id}/prompts
 GET  /prompts?session_id={session_id}
 POST /prompt-decisions/{decision_id}/feedback

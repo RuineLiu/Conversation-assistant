@@ -19,7 +19,7 @@ from proactive_assistant.runtime.contracts import (
     RuntimeFeedbackEvent,
     display_status_for_candidate,
 )
-from proactive_assistant.runtime.store import InMemoryRuntimeStore
+from proactive_assistant.runtime.store import InMemoryRuntimeStore, RuntimeRepository
 
 
 DEFAULT_REWARD_WEIGHTS: dict[str, float] = {
@@ -41,7 +41,7 @@ class PromptRuntimeService:
 
     def __init__(
         self,
-        store: InMemoryRuntimeStore | None = None,
+        store: RuntimeRepository | None = None,
         *,
         reward_weights: dict[str, float] | None = None,
     ) -> None:
@@ -502,6 +502,8 @@ def _memory_candidate(
     reason: str,
 ) -> MemoryCandidate:
     candidate_id = _memory_candidate_id(decision.decision_id, source_event_ids, str(candidate_type), index)
+    prompt_result = decision.candidate.prompt_result
+    opportunity = decision.candidate.opportunity
     return MemoryCandidate(
         memory_candidate_id=candidate_id,
         decision_id=decision.decision_id,
@@ -514,9 +516,24 @@ def _memory_candidate(
         privacy_level=privacy_level or decision.privacy_level,
         reason=reason,
         metadata={
+            "candidate_id": decision.candidate_id,
+            "opportunity_id": decision.opportunity_id,
             "prompt_category": decision.prompt_category,
             "content_granularity": int(decision.content_granularity),
             "prd_surface": _enum_value(decision.prd_surface),
+            "display_mode": _enum_value(decision.display_mode),
+            "duration_policy": _enum_value(decision.duration_policy),
+            "privacy_level": _enum_value(decision.privacy_level),
+            "privacy_risk": decision.privacy_risk,
+            "source_refs": list(prompt_result.source_refs) if prompt_result is not None else [],
+            "source_capture_ref": prompt_result.source_refs[0] if prompt_result is not None and prompt_result.source_refs else "",
+            "captured_text": opportunity.captured_text,
+            "trigger_segment_ids": list(opportunity.trigger_segment_ids),
+            "activity_phase": _enum_value(opportunity.activity_phase),
+            "candidate_timing_action": _enum_value(opportunity.candidate_timing_action),
+            "opportunity_priority": _enum_value(opportunity.priority),
+            "opportunity_reason": opportunity.reason,
+            "safety_flags": sorted(set(opportunity.safety_flags + (prompt_result.safety_flags if prompt_result is not None else []))),
         },
     )
 

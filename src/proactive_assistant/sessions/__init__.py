@@ -12,7 +12,13 @@ from proactive_assistant.sessions.contracts import (
     TranscriptWindow,
 )
 from proactive_assistant.sessions.service import SessionService
-from proactive_assistant.sessions.store import InMemorySessionStore, SessionAlreadyExistsError, SessionNotFoundError
+from proactive_assistant.sessions.store import (
+    InMemorySessionStore,
+    SessionAlreadyExistsError,
+    SessionNotFoundError,
+    SessionRepository,
+    SessionStore,
+)
 
 __all__ = [
     "AssistantSession",
@@ -21,10 +27,12 @@ __all__ = [
     "SessionConfig",
     "SessionContextSnapshot",
     "SessionNotFoundError",
+    "SessionRepository",
     "SessionScene",
     "SessionService",
     "SessionSource",
     "SessionStatus",
+    "SessionStore",
     "TranscriptSegmentInput",
     "TranscriptSegmentRecord",
     "TranscriptWindow",

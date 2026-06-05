@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from proactive_assistant.sessions.contracts import AssistantSession, TranscriptSegmentRecord
 
@@ -15,7 +15,10 @@ class SessionNotFoundError(KeyError):
     pass
 
 
-class SessionStore(Protocol):
+@runtime_checkable
+class SessionRepository(Protocol):
+    """Repository contract for sessions and transcript segments."""
+
     def create_session(self, session: AssistantSession) -> AssistantSession: ...
 
     def update_session(self, session: AssistantSession) -> AssistantSession: ...
@@ -27,6 +30,9 @@ class SessionStore(Protocol):
     def append_transcript(self, segment: TranscriptSegmentRecord) -> TranscriptSegmentRecord: ...
 
     def list_transcript(self, session_id: str) -> list[TranscriptSegmentRecord]: ...
+
+
+SessionStore = SessionRepository
 
 
 class InMemorySessionStore:

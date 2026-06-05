@@ -61,3 +61,13 @@ class ProductFeedbackResult(BaseModel):
     reward_observation: RewardObservation | None = None
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     memories: list[MemoryRecord] = Field(default_factory=list)
+
+
+class ProductMemorySnapshotResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session: AssistantSession
+    meeting_state: MeetingState
+    memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
+    memories: list[MemoryRecord] = Field(default_factory=list)
+    committed: bool = True

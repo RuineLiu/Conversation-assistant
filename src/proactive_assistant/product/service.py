@@ -2,7 +2,14 @@ from typing import Any
 
 from proactive_assistant.detection import opportunities_from_meeting_gaps
 from proactive_assistant.meeting_state import MeetingState, MeetingStateTracker
-from proactive_assistant.memory import InMemoryMemoryStore, MemoryContext, MemoryQuery, MemoryRecord, MemoryService
+from proactive_assistant.memory import (
+    InMemoryMemoryStore,
+    MemoryContext,
+    MemoryQuery,
+    MemoryRecord,
+    MemoryService,
+    memory_candidates_from_meeting_state,
+)
 from proactive_assistant.orchestration import PromptOrchestrationResult, PromptOrchestrator
 from proactive_assistant.runtime import (
     FeedbackPolarity,
@@ -18,6 +25,7 @@ from proactive_assistant.sessions import AssistantSession, SessionConfig, Sessio
 
 from proactive_assistant.product.contracts import (
     ProductFeedbackResult,
+    ProductMemorySnapshotResult,
     ProductPromptPayload,
     ProductTranscriptStepResult,
 )
@@ -220,9 +228,15 @@ class ProductAssistantService:
         limit: int = 8,
         include_pending: bool = False,
         include_archived: bool = False,
+        prompt_category: str | None = None,
+        activity_phase: str = "discussion",
+        prd_surface: str | None = None,
+        active_entities: list[dict[str, Any]] | None = None,
     ) -> MemoryContext:
         session = self.sessions.get_session(session_id)
         org_id, user_id = _memory_identity(session)
+        snapshot = self.sessions.get_context_snapshot(session_id, max_segments=8)
+        state = self._get_or_create_meeting_state(session_id)
         return self.memory.search_context(
             MemoryQuery(
                 query_text=query_text,
@@ -232,6 +246,12 @@ class ProductAssistantService:
                 include_pending=include_pending,
                 include_archived=include_archived,
                 limit=limit,
+                prompt_category=prompt_category,
+                activity_phase=activity_phase,
+                recent_transcript_text="\n".join(segment.text for segment in snapshot.recent_transcript.segments),
+                active_entities=active_entities or _active_entities_from_meeting_state(state),
+                privacy_constraints=session.privacy_constraints,
+                prd_surface=prd_surface,
             )
         )
 
@@ -243,6 +263,34 @@ class ProductAssistantService:
 
     def archive_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord:
         return self.memory.archive_memory(memory_id, reason=reason)
+
+    def write_meeting_state_memory_snapshot(
+        self,
+        session_id: str,
+        *,
+        commit: bool = True,
+        include_gaps: bool = True,
+    ) -> ProductMemorySnapshotResult:
+        session = self.sessions.get_session(session_id)
+        state = self._get_or_create_meeting_state(session_id)
+        current_ms = max((utterance.end_ms for utterance in state.utterances), default=None)
+        gaps = self.meeting_state_tracker.scan_state_gaps(state, current_ms=current_ms) if include_gaps else []
+        candidates = memory_candidates_from_meeting_state(state, gaps=gaps)
+        memories = (
+            [
+                self.memory.commit_candidate_once(candidate, org_id=state.org_id, user_id=state.subject_user_id)
+                for candidate in candidates
+            ]
+            if commit
+            else []
+        )
+        return ProductMemorySnapshotResult(
+            session=session,
+            meeting_state=state,
+            memory_candidates=candidates,
+            memories=memories,
+            committed=commit,
+        )
 
     def _persist_memory_candidates_for_event(self, decision_id: str, event_id: str) -> list[MemoryCandidate]:
         candidates = [
@@ -343,3 +391,56 @@ def _merge_unique(first: list[str], second: list[str]) -> list[str]:
 
 def _gaps_for_current_segment(gaps: list[Any], segment_id: str) -> list[Any]:
     return [gap for gap in gaps if not gap.source_utterance_ids or segment_id in gap.source_utterance_ids]
+
+
+def _active_entities_from_meeting_state(state: MeetingState) -> list[dict[str, Any]]:
+    entities: list[dict[str, Any]] = []
+    for item in state.action_items:
+        entities.append(
+            {
+                "id": item.action_item_id,
+                "canonical_name": item.desc,
+                "type": "action",
+                "aliases": [item.owner, item.deadline, item.next_step],
+                "last_ts": item.source_ts_ms,
+            }
+        )
+    for item in state.decisions:
+        entities.append(
+            {
+                "id": item.decision_id,
+                "canonical_name": item.topic,
+                "type": "decision",
+                "aliases": [item.conclusion],
+                "last_ts": item.ts_ms,
+            }
+        )
+    for item in state.risks:
+        entities.append(
+            {
+                "id": item.risk_id,
+                "canonical_name": item.desc,
+                "type": "risk",
+                "aliases": [],
+                "last_ts": item.ts_ms,
+            }
+        )
+    for item in state.mentioned_refs:
+        entities.append(
+            {
+                "id": item.mentioned_ref_id,
+                "canonical_name": item.text,
+                "type": item.ref_type,
+                "aliases": [],
+                "last_ts": item.ts_ms,
+            }
+        )
+    return [_clean_active_entity(entity) for entity in entities]
+
+
+def _clean_active_entity(entity: dict[str, Any]) -> dict[str, Any]:
+    aliases = entity.get("aliases", [])
+    return {
+        **entity,
+        "aliases": [str(alias) for alias in aliases if alias],
+    }

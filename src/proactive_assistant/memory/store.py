@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from proactive_assistant.memory.contracts import (
     MemoryQuery,
@@ -27,7 +27,10 @@ class MemoryNotFoundError(MemoryStoreError):
     """Raised when a memory id does not exist."""
 
 
-class MemoryStore(Protocol):
+@runtime_checkable
+class MemoryRepository(Protocol):
+    """Repository contract for long-term memory records and deterministic retrieval."""
+
     def add_memory(self, memory: MemoryRecord) -> MemoryRecord: ...
 
     def get_memory(self, memory_id: str) -> MemoryRecord: ...
@@ -39,6 +42,9 @@ class MemoryStore(Protocol):
     def update_memory(self, memory_id: str, update: MemoryRecordUpdate) -> MemoryRecord: ...
 
     def archive_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord: ...
+
+
+MemoryStore = MemoryRepository
 
 
 class InMemoryMemoryStore:

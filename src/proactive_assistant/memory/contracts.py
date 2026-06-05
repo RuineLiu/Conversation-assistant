@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from proactive_assistant.prompting import PrivacyLevel
+from proactive_assistant.prompting import PRDSurface, PrivacyLevel, PromptCategory
 
 
 class MemoryType(StrEnum):
@@ -47,6 +47,21 @@ class MemoryWriteStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     REJECTED = "rejected"
+
+
+class MemoryRetrievalIntent(StrEnum):
+    LOOKUP_DEADLINE = "lookup_deadline"
+    LOOKUP_OWNER = "lookup_owner"
+    LOOKUP_STATUS = "lookup_status"
+    LOOKUP_RATIONALE = "lookup_rationale"
+    OPEN_RECALL = "open_recall"
+
+
+class MemoryUsePolicy(StrEnum):
+    PROMPT_CONTEXT = "prompt_context"
+    POLICY_HINT = "policy_hint"
+    DISPLAY_REF_ONLY = "display_ref_only"
+    BLOCKED_BY_PRIVACY = "blocked_by_privacy"
 
 
 class MemoryRecord(BaseModel):
@@ -113,15 +128,30 @@ class MemoryQuery(BaseModel):
     include_archived: bool = False
     include_pending: bool = False
     limit: int = Field(default=20, ge=1, le=200)
+    prompt_category: PromptCategory | None = None
+    activity_phase: str = "discussion"
+    current_gap_types: list[str] = Field(default_factory=list)
+    recent_transcript_text: str = ""
+    active_entities: list[dict[str, Any]] = Field(default_factory=list)
+    target_entity: str | None = None
+    privacy_constraints: list[str] = Field(default_factory=list)
+    prd_surface: PRDSurface | None = None
+    reference_time: datetime | None = None
+    shown_memory_ids: list[str] = Field(default_factory=list)
 
 
 class MemorySearchResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
 
     memory: MemoryRecord
     score: float = Field(ge=0.0)
     matched_terms: list[str] = Field(default_factory=list)
     reason: str = ""
+    rank_features: dict[str, float] = Field(default_factory=dict)
+    use_policy: MemoryUsePolicy = MemoryUsePolicy.PROMPT_CONTEXT
+    provenance: list[str] = Field(default_factory=list)
+    intent: MemoryRetrievalIntent = MemoryRetrievalIntent.OPEN_RECALL
+    target_entity: str | None = None
 
 
 class MemoryContext(BaseModel):

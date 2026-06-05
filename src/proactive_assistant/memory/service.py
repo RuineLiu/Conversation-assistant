@@ -9,13 +9,15 @@ from proactive_assistant.memory.contracts import (
     MemoryRecord,
     MemoryRecordUpdate,
     MemoryScope,
-    MemorySearchResult,
     MemorySource,
     MemoryType,
     MemoryWriteStatus,
     RetentionPolicy,
 )
-from proactive_assistant.memory.store import MemoryStore
+from proactive_assistant.memory.consolidation import consolidated_memory_metadata, consolidated_memory_tags
+from proactive_assistant.memory.retrieval import MemoryRetriever
+from proactive_assistant.memory.store import MemoryRepository
+from proactive_assistant.memory.store import MemoryAlreadyExistsError
 from proactive_assistant.prompting import PrivacyLevel
 from proactive_assistant.runtime import MemoryCandidate, MemoryCandidateType, MemoryWritePolicy
 
@@ -23,7 +25,7 @@ from proactive_assistant.runtime import MemoryCandidate, MemoryCandidateType, Me
 class MemoryService:
     """Lifecycle service for converting candidates into long-term memories."""
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryRepository) -> None:
         self.store = store
 
     def propose_from_candidate(
@@ -36,6 +38,7 @@ class MemoryService:
         candidate_type = MemoryCandidateType(candidate.candidate_type)
         write_policy = MemoryWritePolicy(candidate.write_policy)
         now = datetime.now(UTC)
+        metadata = consolidated_memory_metadata(candidate)
         return MemoryRecord(
             memory_id=_memory_id_for_candidate(candidate),
             memory_type=_memory_type_for_candidate(candidate_type),
@@ -54,15 +57,7 @@ class MemoryService:
             tags=_tags_for_candidate(candidate_type, candidate),
             created_at=now,
             updated_at=now,
-            metadata={
-                "candidate_id": candidate.memory_candidate_id,
-                "candidate_type": str(candidate.candidate_type),
-                "decision_id": candidate.decision_id,
-                "source_event_ids": list(candidate.source_event_ids),
-                "write_policy": str(candidate.write_policy),
-                "reason": candidate.reason,
-                "candidate_metadata": candidate.metadata,
-            },
+            metadata=metadata,
         )
 
     def commit_candidate(
@@ -74,6 +69,19 @@ class MemoryService:
     ) -> MemoryRecord:
         memory = self.propose_from_candidate(candidate, org_id=org_id, user_id=user_id)
         return self.store.add_memory(memory)
+
+    def commit_candidate_once(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        org_id: str = "default_org",
+        user_id: str = "default_user",
+    ) -> MemoryRecord:
+        memory = self.propose_from_candidate(candidate, org_id=org_id, user_id=user_id)
+        try:
+            return self.store.add_memory(memory)
+        except MemoryAlreadyExistsError:
+            return self.store.get_memory(memory.memory_id)
 
     def confirm_memory(self, memory_id: str) -> MemoryRecord:
         return self.store.update_memory(memory_id, MemoryRecordUpdate(write_status=MemoryWriteStatus.ACTIVE))
@@ -92,12 +100,7 @@ class MemoryService:
         return self.store.archive_memory(memory_id, reason=reason)
 
     def search_context(self, query: MemoryQuery) -> MemoryContext:
-        results = self.store.search_memories(query)
-        return MemoryContext(
-            memory_context=[_context_line(result) for result in results],
-            memory_refs=[f"memory:{result.memory.memory_id}" for result in results],
-            results=results,
-        )
+        return MemoryRetriever(self.store).retrieve(query)
 
 
 def _memory_id_for_candidate(candidate: MemoryCandidate) -> str:
@@ -181,9 +184,4 @@ def _tags_for_candidate(candidate_type: MemoryCandidateType, candidate: MemoryCa
     if candidate_type == MemoryCandidateType.ACTION_ITEM:
         tags.add("action")
     tags.update(str(tag) for tag in candidate.metadata.get("tags", []) if str(tag))
-    return sorted(tags)
-
-
-def _context_line(result: MemorySearchResult) -> str:
-    memory = result.memory
-    return f"[memory:{memory.memory_id}] ({memory.memory_type}/{memory.scope}) {memory.text}"
+    return consolidated_memory_tags(candidate, tags)

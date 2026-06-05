@@ -229,6 +229,25 @@ def test_confirmed_memory_context_is_returned_and_used_by_transcript_endpoint() 
     assert second_step.json()["retrieved_memory_context"]["memory_refs"] == [f"memory:{memory_id}"]
 
 
+def test_memory_snapshot_endpoint_can_preview_and_commit_meeting_state_memories() -> None:
+    client = create_client()
+    create_session(client)
+    append_gap_transcript(client)
+
+    preview = client.post("/sessions/session_api_001/memory-snapshot", json={"commit": False})
+    committed = client.post("/sessions/session_api_001/memory-snapshot")
+
+    assert preview.status_code == 200
+    assert preview.json()["committed"] is False
+    assert preview.json()["memory_candidates"]
+    assert preview.json()["memories"] == []
+    assert committed.status_code == 200
+    assert committed.json()["committed"] is True
+    assert committed.json()["memory_candidates"]
+    assert committed.json()["memories"]
+    assert committed.json()["memories"][0]["metadata"]["memory_snapshot_source"] == "meeting_state_snapshot_v1"
+
+
 def test_reject_and_archive_memory_endpoints_hide_memory_context() -> None:
     client = create_client()
     create_session(client)

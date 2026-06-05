@@ -110,6 +110,11 @@ def test_positive_feedback_builds_positive_reward_and_action_item_memory_candida
     action_item = [candidate for candidate in memory_candidates if candidate.candidate_type == MemoryCandidateType.ACTION_ITEM][0]
     assert action_item.write_policy == MemoryWritePolicy.NEEDS_CONFIRMATION
     assert "owner" in action_item.text
+    assert action_item.metadata["source_refs"] == ["transcript:seg_0"]
+    assert action_item.metadata["source_capture_ref"] == "transcript:seg_0"
+    assert action_item.metadata["captured_text"].startswith("这个问题谁负责")
+    assert action_item.metadata["trigger_segment_ids"] == ["seg_0"]
+    assert action_item.metadata["prd_surface"] == "glasses_popup"
 
 
 def test_negative_feedback_builds_negative_reward_and_privacy_memory_candidate() -> None:

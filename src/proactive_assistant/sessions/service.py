@@ -10,7 +10,7 @@ from proactive_assistant.sessions.contracts import (
     TranscriptSegmentRecord,
     TranscriptWindow,
 )
-from proactive_assistant.sessions.store import SessionStore
+from proactive_assistant.sessions.store import SessionRepository
 from proactive_assistant.sessions.windowing import (
     recent_window_by_chars,
     recent_window_by_segments,
@@ -19,7 +19,7 @@ from proactive_assistant.sessions.windowing import (
 
 
 class SessionService:
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(self, store: SessionRepository) -> None:
         self._store = store
 
     def create_session(

@@ -1,10 +1,12 @@
+import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from proactive_assistant.meeting_state import MeetingGap, MeetingState
-from proactive_assistant.memory import MemoryContext, MemoryNotFoundError, MemoryRecord
+from proactive_assistant.memory import MemoryContext, MemoryNotFoundError, MemoryRecord, MemoryService
 from proactive_assistant.model_gateway import (
     ModelGatewaySettings,
     OpenAIChatCompletionsClient,
@@ -13,7 +15,8 @@ from proactive_assistant.model_gateway import (
 from proactive_assistant.orchestration import PromptOrchestrator
 from proactive_assistant.product.contracts import ProductPromptPayload
 from proactive_assistant.product.service import ProductAssistantService
-from proactive_assistant.prompting import PromptGenerationService
+from proactive_assistant.prompting import PRDSurface, PromptCategory, PromptGenerationService
+from proactive_assistant.persistence import SQLiteMemoryStore, SQLiteRuntimeStore, SQLiteSessionStore
 from proactive_assistant.runtime import (
     FeedbackPolarity,
     FeedbackSignalSource,
@@ -154,6 +157,22 @@ class MemoryContextResponse(BaseModel):
 
     session_id: str
     memory_context: MemoryContext
+
+
+class MemorySnapshotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    commit: bool = True
+    include_gaps: bool = True
+
+
+class MemorySnapshotResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
+    memories: list[MemoryRecord] = Field(default_factory=list)
+    committed: bool = True
 
 
 class MemoryMutationRequest(BaseModel):
@@ -314,6 +333,9 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
         limit: int = Query(default=8, ge=1, le=50),
         include_pending: bool = Query(default=False),
         include_archived: bool = Query(default=False),
+        prompt_category: PromptCategory | None = Query(default=None),
+        activity_phase: str = Query(default="discussion"),
+        prd_surface: PRDSurface | None = Query(default=None),
     ) -> MemoryContextResponse:
         try:
             memory_context = service.search_memory_context_for_session(
@@ -322,10 +344,34 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                 limit=limit,
                 include_pending=include_pending,
                 include_archived=include_archived,
+                prompt_category=prompt_category,
+                activity_phase=activity_phase,
+                prd_surface=prd_surface,
             )
         except SessionNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return MemoryContextResponse(session_id=session_id, memory_context=memory_context)
+
+    @app.post("/sessions/{session_id}/memory-snapshot", response_model=MemorySnapshotResponse)
+    def write_session_memory_snapshot(
+        session_id: str,
+        request: MemorySnapshotRequest | None = None,
+    ) -> MemorySnapshotResponse:
+        resolved_request = request or MemorySnapshotRequest()
+        try:
+            result = service.write_meeting_state_memory_snapshot(
+                session_id,
+                commit=resolved_request.commit,
+                include_gaps=resolved_request.include_gaps,
+            )
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return MemorySnapshotResponse(
+            session_id=result.session.session_id,
+            memory_candidates=result.memory_candidates,
+            memories=result.memories,
+            committed=result.committed,
+        )
 
     @app.post("/memories/{memory_id}/confirm", response_model=MemoryMutationResponse)
     def confirm_memory(memory_id: str) -> MemoryMutationResponse:
@@ -357,11 +403,27 @@ def create_default_product_service(settings: ModelGatewaySettings | None = None)
         model_client=_build_model_client(resolved_settings),
         settings=resolved_settings,
     )
+    session_store, runtime_service, memory_service = _build_storage_services()
     return ProductAssistantService(
-        session_service=SessionService(InMemorySessionStore()),
+        session_service=SessionService(session_store),
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
-        runtime_service=PromptRuntimeService(),
+        runtime_service=runtime_service,
+        memory_service=memory_service,
     )
+
+
+def _build_storage_services() -> tuple[InMemorySessionStore | SQLiteSessionStore, PromptRuntimeService, MemoryService | None]:
+    backend = os.getenv("PROACTIVE_STORAGE_BACKEND", os.getenv("STORAGE_BACKEND", "memory")).strip().lower()
+    if backend in {"", "memory", "in_memory", "in-memory"}:
+        return InMemorySessionStore(), PromptRuntimeService(), None
+    if backend == "sqlite":
+        db_path = Path(os.getenv("PROACTIVE_SQLITE_PATH", "data/local/proactive.db"))
+        return (
+            SQLiteSessionStore(db_path),
+            PromptRuntimeService(SQLiteRuntimeStore(db_path)),
+            MemoryService(SQLiteMemoryStore(db_path)),
+        )
+    raise ValueError(f"unsupported storage backend: {backend}")
 
 
 def _build_model_client(settings: ModelGatewaySettings) -> OpenAIResponsesClient | OpenAIChatCompletionsClient:
