@@ -9,9 +9,15 @@ description = "Simulation-first proactive assistant research framework."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.115,<1",
+  "openai>=2,<3",
   "pydantic>=2.7,<3",
+  "pydantic-settings>=2,<3",
   "PyYAML>=6.0,<7",
 ]
+
+[project.scripts]
+proactive-assistant = "proactive_assistant.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -24,3 +30,10 @@ parquet = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27,<1",
+    "pytest>=8.0,<9",
+    "uvicorn>=0.30,<1",
+]
