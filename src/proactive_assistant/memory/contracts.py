@@ -31,6 +31,7 @@ class MemorySource(StrEnum):
     FEEDBACK_CANDIDATE = "feedback_candidate"
     TRANSCRIPT = "transcript"
     MEETING_STATE = "meeting_state"
+    PROMOTED = "promoted"
     IMPORTED = "imported"
 
 
@@ -47,6 +48,42 @@ class MemoryWriteStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     REJECTED = "rejected"
+    FORGOTTEN = "forgotten"
+
+
+class MemoryUpsertStatus(StrEnum):
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+
+
+class MemoryUpdatePolicyDecision(StrEnum):
+    AUTO_UPDATE = "auto_update"
+    NEEDS_CONFIRMATION = "needs_confirmation"
+    BLOCKED = "blocked"
+
+
+class MemoryPendingUpdateStatus(StrEnum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    REJECTED = "rejected"
+
+
+class MemoryPromotionStatus(StrEnum):
+    PROMOTED = "promoted"
+    UNCHANGED = "unchanged"
+    NEEDS_CONFIRMATION = "needs_confirmation"
+    BLOCKED = "blocked"
+
+
+class MemoryMergeAction(StrEnum):
+    CREATE = "create"
+    DUPLICATE = "duplicate"
+    REINFORCEMENT = "reinforcement"
+    UPDATE = "update"
+    CONFLICT = "conflict"
+    SUPERSEDE = "supersede"
+    BLOCKED = "blocked"
 
 
 class MemoryRetrievalIntent(StrEnum):
@@ -104,6 +141,8 @@ class MemoryRecordUpdate(BaseModel):
     org_id: str | None = Field(default=None, min_length=1)
     user_id: str | None = Field(default=None, min_length=1)
     session_id: str | None = None
+    source: MemorySource | None = None
+    source_ids: list[str] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     importance: float | None = Field(default=None, ge=0.0, le=1.0)
     privacy_level: PrivacyLevel | None = None
@@ -126,6 +165,7 @@ class MemoryQuery(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     include_archived: bool = False
+    include_forgotten: bool = False
     include_pending: bool = False
     limit: int = Field(default=20, ge=1, le=200)
     prompt_category: PromptCategory | None = None
@@ -138,6 +178,8 @@ class MemoryQuery(BaseModel):
     prd_surface: PRDSurface | None = None
     reference_time: datetime | None = None
     shown_memory_ids: list[str] = Field(default_factory=list)
+    use_semantic_retrieval: bool = False
+    semantic_min_score: float = Field(default=0.25, ge=0.0, le=1.0)
 
 
 class MemorySearchResult(BaseModel):
@@ -160,3 +202,74 @@ class MemoryContext(BaseModel):
     memory_context: list[str] = Field(default_factory=list)
     memory_refs: list[str] = Field(default_factory=list)
     results: list[MemorySearchResult] = Field(default_factory=list)
+
+
+class MemoryMergeDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    action: MemoryMergeAction = MemoryMergeAction.CREATE
+    existing_memory_id: str | None = None
+    proposed_memory_id: str | None = None
+    similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    changed_fields: list[str] = Field(default_factory=list)
+    conflict_fields: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+    resolution_status: str = "resolved"
+
+
+class MemoryUpsertResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    status: MemoryUpsertStatus
+    memory: MemoryRecord
+    previous_memory: MemoryRecord | None = None
+    proposed_memory: MemoryRecord | None = None
+    changed_fields: list[str] = Field(default_factory=list)
+    previous_digest: str | None = None
+    new_digest: str
+    version: int = Field(ge=1)
+    update_policy: MemoryUpdatePolicyDecision = MemoryUpdatePolicyDecision.AUTO_UPDATE
+    policy_reasons: list[str] = Field(default_factory=list)
+    pending_update: "MemoryPendingUpdate | None" = None
+    merge_decision: MemoryMergeDecision | None = None
+
+
+class MemoryPendingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    update_id: str = Field(min_length=1)
+    memory_id: str = Field(min_length=1)
+    proposed_memory: MemoryRecord
+    previous_digest: str
+    new_digest: str
+    changed_fields: list[str] = Field(default_factory=list)
+    update_policy: MemoryUpdatePolicyDecision = MemoryUpdatePolicyDecision.NEEDS_CONFIRMATION
+    policy_reasons: list[str] = Field(default_factory=list)
+    status: MemoryPendingUpdateStatus = MemoryPendingUpdateStatus.PENDING
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    resolved_at: datetime | None = None
+    resolved_reason: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryForgetResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory: MemoryRecord
+    invalidated_pending_updates: list[MemoryPendingUpdate] = Field(default_factory=list)
+    reason: str = ""
+    redacted: bool = True
+
+
+class MemoryPromotionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    status: MemoryPromotionStatus
+    source_memory: MemoryRecord
+    promoted_memory: MemoryRecord | None = None
+    proposed_memory: MemoryRecord | None = None
+    target_scope: MemoryScope
+    target_memory_type: MemoryType
+    policy_reasons: list[str] = Field(default_factory=list)
+    approved: bool = False

@@ -30,6 +30,7 @@ src/proactive_assistant/detection/
   service.py
 src/proactive_assistant/model_gateway/
   clients.py
+  embeddings.py
   settings.py
   smoke.py
 src/proactive_assistant/meeting_state/
@@ -37,9 +38,11 @@ src/proactive_assistant/meeting_state/
   rules.py
   service.py
 src/proactive_assistant/memory/
+  compression.py
   contracts.py
   service.py
   store.py
+  vector_store.py
 src/proactive_assistant/orchestration/
   contracts.py
   service.py
@@ -208,6 +211,79 @@ uv run proactive-assistant smoke-openai-prompt \
 
 If the compatible endpoint does not support `response_format={"type":"json_schema"}`, try `--chat-response-format json_object`. The parser can still read a JSON object from plain or fenced model text, but strict schema support is preferred.
 
+Live memory extraction smoke test:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="http://{addr}:58081"
+export OPENAI_API_STYLE="chat_completions"
+
+uv run proactive-assistant smoke-openai-memory-extraction \
+  --model "gpt-5.5" \
+  --base-url "$OPENAI_BASE_URL" \
+  --api-style chat_completions \
+  --chat-response-format json_object \
+  --json-indent 2
+```
+
+This command sends a fixed Chinese meeting transcript and validates whether the model extracts structured memory candidates. For OpenAI-compatible Chat Completions endpoints, `json_object` is the recommended smoke-test format because some compatible gateways return empty message content for complex strict `json_schema` payloads. `quality_gate_passed=true` means the smoke output included at least one action item, the expected owner `张三`, the expected deadline `下周五`, one decision, source refs for every candidate, and no blocked candidates. A failed quality gate does not necessarily mean the API is broken; it means the extraction prompt or model choice needs tuning before we rely on it in product flow.
+
+Live memory compression smoke test:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="http://{addr}:58081"
+export OPENAI_API_STYLE="chat_completions"
+
+uv run proactive-assistant smoke-openai-memory-compression \
+  --model "gpt-5.5" \
+  --base-url "$OPENAI_BASE_URL" \
+  --api-style chat_completions \
+  --chat-response-format json_object \
+  --json-indent 2
+```
+
+This command sends the same fixed Chinese meeting transcript as a compression chunk and validates whether the model returns a grounded `chunk_summary`, key points, open questions, source refs, compression quality scores, and memory candidates. Compression is not a direct write path: candidate memories still flow through the same memory lifecycle, confirmation, upsert, privacy, and retrieval policies.
+
+Memory extraction fixture evaluation:
+
+```bash
+uv run proactive-assistant evaluate-memory-extraction-fixtures \
+  --mode fixture \
+  --json-indent 2
+```
+
+Fixture mode is offline and uses `tests/fixtures/memory_extraction/cases.json`. It validates the evaluator itself and covers action items, decisions, person/role facts, privacy preference redaction, and no-memory small talk.
+
+Live evaluation uses the same fixtures but calls the configured model gateway:
+
+```bash
+uv run proactive-assistant evaluate-memory-extraction-fixtures \
+  --mode live \
+  --model "gpt-5.5" \
+  --base-url "$OPENAI_BASE_URL" \
+  --api-style chat_completions \
+  --chat-response-format json_object \
+  --json-indent 2
+```
+
+The report returns `case_count`, `pass_count`, `failed_cases`, total `candidate_count`, and per-case failed checks. This is the first quality gate before using LLM-extracted memories as product candidates.
+
+Live embedding smoke test:
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_BASE_URL="http://{addr}:58081"
+export OPENAI_EMBEDDING_MODEL="<your-embedding-model>"
+
+uv run proactive-assistant smoke-openai-embedding \
+  --model "$OPENAI_EMBEDDING_MODEL" \
+  --base-url "$OPENAI_BASE_URL" \
+  --json-indent 2
+```
+
+This command calls the OpenAI-compatible embedding API with two fixed Chinese texts and prints provider, model, latency, vector dimension, and a short vector preview. It is only a connectivity and shape check; retrieval quality is evaluated through memory retrieval tests and later offline/online recall metrics.
+
 Minimal service usage:
 
 ```python
@@ -341,6 +417,7 @@ MemoryRecord
 MemoryQuery
 MemorySearchResult
 MemoryRecordUpdate
+MemoryForgetResult
 MemoryType
 MemoryScope
 MemorySource
@@ -358,6 +435,7 @@ list_memories
 search_memories
 update_memory
 archive_memory
+forget_memory
 ```
 
 `MemoryService` adds the candidate-to-memory lifecycle on top of the store:
@@ -368,6 +446,7 @@ commit_candidate
 confirm_memory
 reject_memory
 archive_memory
+forget_memory
 search_context
 ```
 
@@ -379,6 +458,10 @@ NEGATIVE_PREFERENCE  -> MemoryType.NEGATIVE_PREFERENCE / user scope / until_revo
 PRIVACY_PREFERENCE   -> MemoryType.PRIVACY_PREFERENCE / user scope / high privacy / until_revoked
 MEETING_FACT         -> MemoryType.MEETING_FACT / session scope / 90d
 ACTION_ITEM          -> MemoryType.ACTION_ITEM / session scope / 90d
+DECISION             -> MemoryType.DECISION / session scope / 90d
+PERSON_OR_FACT       -> MemoryType.PERSON_OR_FACT / session scope / 90d
+PROJECT_CONTEXT      -> MemoryType.PROJECT_CONTEXT / session scope / 90d
+SUMMARY              -> MemoryType.SUMMARY / session scope / 30d
 
 ELIGIBLE             -> active memory
 NEEDS_CONFIRMATION   -> pending_confirmation memory
@@ -402,6 +485,84 @@ The write path never overwrites explicit structured metadata supplied by upstrea
 
 Meeting state snapshot memory writing v1 can turn the current `MeetingState` into memory candidates and optionally commit them. It currently exports action items, decisions, risks, and tracked gaps. This path is explicit rather than automatic: product callers trigger it through the service or API when a session reaches a checkpoint such as meeting end.
 
+LLM memory extraction v1 adds a model-backed candidate extraction path for transcript windows. It reuses the existing `ModelClient.generate_structured` gateway and returns structured `MemoryCandidate` objects instead of writing directly to storage. The model output is constrained to:
+
+```text
+candidate_type
+text
+confidence
+write_policy
+privacy_level / privacy_risk
+source_refs
+entity / owner / deadline / status / topic
+tags
+promotion_candidate
+```
+
+Product callers can preview candidates or commit them through the same upsert path as deterministic snapshots. This means extracted owner/deadline/privacy-sensitive changes still go through confirmation policy, and forgotten memories cannot be recreated by stale extraction updates.
+
+Memory compression v1 adds a model-backed transcript chunk compression path. It does not replace extraction; it wraps extraction-ready candidates with compression artifacts that support long-running sessions:
+
+```text
+MemoryCompressionRequest
+  transcript_window
+  session_context
+  meeting_state
+  memory_context
+  privacy_constraints
+
+MemoryCompressionResult
+  chunk_summary
+  key_points
+  open_questions
+  candidate_memories
+  source_refs
+  compression_quality
+  coverage_score
+  loss_risk_score
+```
+
+The compression contract is designed for hierarchical memory: raw transcript remains the evidence layer, chunk summaries reduce context size, and atomic candidate memories remain the product-facing recall layer. All compressed outputs must be grounded in source refs, and candidate memories continue to use the existing memory write policy instead of being automatically committed.
+
+Snapshot commits now use memory upsert/versioning v1. The first write creates a memory with `memory_version = 1`; repeated writes with identical content return `unchanged`; later changes to the same stable meeting-state object update the existing memory id, increment `memory_version`, and append a compact `memory_version_history` entry. Archived or rejected memories are not automatically reactivated by snapshot upserts.
+
+Memory conflict/merge v1 runs before creating a new memory. It compares the proposed memory against same-type memories for the same org/user/session using structured target fields and text similarity:
+
+```text
+duplicate      -> same fact from another candidate id; keep existing memory
+reinforcement  -> same structured fact with new evidence; merge source refs/tags and raise confidence
+update         -> non-conflicting structured change; update through normal upsert policy
+conflict       -> owner/deadline/status conflict; create pending update for confirmation
+supersede      -> explicit correction/replacement signal; create pending update with supersede metadata
+blocked        -> related archived/rejected/forgotten memory; do not recreate it
+```
+
+Merge decisions are returned on `MemoryUpsertResult.merge_decision` and recorded in memory metadata as `memory_merge_history` when a stored memory changes.
+
+Memory update policy v1 gates those upserts before storage mutation:
+
+```text
+auto_update         -> low-risk non-sensitive changes can update the existing memory
+needs_confirmation  -> owner/deadline/privacy/preference changes return proposed_memory but do not overwrite
+blocked             -> archived/rejected/forgotten memories and rejected proposed updates are left unchanged
+```
+
+This keeps live recall stable: a possible ASR or extraction correction can be surfaced for confirmation without silently replacing a currently active owner, deadline, or privacy-sensitive memory.
+
+Confirmation-required updates are persisted as `MemoryPendingUpdate` records. Product callers can list pending updates for a memory, apply a user-confirmed proposal, or reject it. Apply validates the current memory digest before mutation, so stale proposals cannot overwrite a newer memory state.
+
+Memory forget/delete v1 closes the long-term memory lifecycle. Forgetting a memory is implemented as a redacted tombstone instead of a physical delete: the record keeps its id, scope, org/user/session identity, deletion timestamp, and deletion reason, while text, source ids, tags, confidence, importance, and non-audit metadata are cleared. Forgotten memories are excluded from retrieval and default listing even when archived memories are included. Any pending updates for that memory are rejected at delete time, preventing an older proposal from writing the memory back later.
+
+Cross-session memory promotion v1 turns selected session memories into longer-lived memories. It uses deterministic policy gates before writing:
+
+```text
+auto promotion       -> project context, long-term facts, and explicit promotion candidates
+needs confirmation   -> action items, meeting summaries, high-privacy, or high-risk memories
+blocked              -> inactive memories and memories already outside session scope
+```
+
+Promoted memories are ordinary `MemoryRecord` objects with `source = promoted`, a deterministic `memprom_*` id, non-session scope such as `user` or `org`, and metadata linking them back to the source memory and source session. Because retrieval already treats non-session memories as visible across sessions, promoted memories immediately become available to later meetings with matching org/user filters.
+
 The first retrieval implementation is deterministic. It filters by org, user, session visibility, type, scope, privacy level, source ids, tags, and write status, then ranks by keyword overlap, importance, confidence, and recency. It does not call an embedding model, vector database, or LLM yet.
 
 Memory retrieval v1 adds an explainable deterministic ranker on top of the same store contract:
@@ -418,6 +579,19 @@ query + prompt category + meeting context
 ```
 
 Exact lookup is intentionally conservative: weak target matches become `display_ref_only` or no recall instead of fabricating a deadline, owner, or status. High-privacy memories on glasses surfaces are also returned as references only, not as full text context.
+
+Hybrid semantic retrieval v1 adds an optional embedding/vector path:
+
+```text
+MemoryService(..., embedding_client, vector_store, embedding_model)
++ MemoryQuery(use_semantic_retrieval=True)
+-> embed query
+-> reuse or create memory embedding in MemoryVectorStore
+-> compute cosine similarity
+-> blend semantic score with lexical/type/scope/recency/importance/confidence features
+```
+
+`SQLiteMemoryVectorStore` persists vectors in a `memory_embeddings` table so local experiments do not re-embed every memory after restart. v1 stores vectors as JSON and computes cosine similarity in Python; this keeps setup simple while preserving a clean replacement boundary for pgvector, Qdrant, or another production vector DB. Semantic retrieval is opt-in and does not replace conservative exact lookup for owner/deadline/status.
 
 Minimal usage:
 
@@ -618,14 +792,27 @@ result = PromptOrchestrator(prompt_service=prompt_service).run(snapshot)
 ```text
 append transcript
 -> update live meeting state
--> retrieve active memory context
--> build session snapshot
 -> detect prompt opportunities
 -> merge structured meeting gaps as extra opportunities
+-> retrieve memory context per opportunity
+-> build memory-aware prompt snapshot
 -> generate prompt candidates
--> log prompt decisions
+-> log prompt decisions with memory refs/query metadata
 -> return product prompt payloads
 ```
+
+Memory retrieval is opportunity-aware: the query uses the opportunity captured text, prompt category, activity phase, PRD surface, active meeting entities, privacy constraints, and recent transcript. The generated `PromptGenerationRequest` receives the resolved `memory_context`, while the logged `PromptDecisionRecord.metadata` records:
+
+```text
+memory_refs
+retrieved_memory_refs
+retrieved_memory_result_count
+memory_query_text
+memory_query_prompt_category
+memory_query_activity_phase
+```
+
+This creates the first policy-data bridge for later offline evaluation and RL: every prompt decision can be traced back to the memory context that influenced it.
 
 Feedback goes through the same layer:
 
@@ -684,12 +871,18 @@ GET  /sessions/{session_id}/meeting-state
 GET  /sessions/{session_id}/memory-candidates
 GET  /sessions/{session_id}/memory-context
 POST /sessions/{session_id}/memory-snapshot
+POST /sessions/{session_id}/memory-extraction
 GET  /sessions/{session_id}/prompts
 GET  /prompts?session_id={session_id}
 POST /prompt-decisions/{decision_id}/feedback
 POST /memories/{memory_id}/confirm
 POST /memories/{memory_id}/reject
 POST /memories/{memory_id}/archive
+DELETE /memories/{memory_id}
+POST /memories/{memory_id}/promote
+GET  /memories/{memory_id}/pending-updates
+POST /memory-updates/{update_id}/apply
+POST /memory-updates/{update_id}/reject
 ```
 
 The transcript endpoint returns frontend-ready prompt payloads plus live `meeting_state`, latest `meeting_gaps`, and retrieved memory context. It does not expose full internal snapshots or prompt candidate objects.

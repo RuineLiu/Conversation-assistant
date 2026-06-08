@@ -21,6 +21,7 @@ from proactive_assistant.product.api import _build_storage_services
 from proactive_assistant.prompting import PromptGenerationService
 from proactive_assistant.repositories import MemoryRepository, RuntimeRepository, SessionRepository
 from proactive_assistant.runtime import FeedbackSignalType, PromptRuntimeService
+from proactive_assistant.runtime import MemoryCandidate, MemoryCandidateType, MemoryWritePolicy
 from proactive_assistant.sessions import SessionConfig, SessionService, TranscriptSegmentInput
 
 
@@ -106,6 +107,76 @@ def test_sqlite_memory_store_persists_and_searches_after_reopen(tmp_path: Path) 
     assert results[0].matched_terms == ["deadline", "owner"]
 
 
+def test_sqlite_memory_pending_update_persists_and_applies_after_reopen(tmp_path: Path) -> None:
+    db_path = tmp_path / "proactive.db"
+    service = MemoryService(SQLiteMemoryStore(db_path))
+    created = service.upsert_candidate(
+        _candidate(
+            "张三负责客户报价确认，下周五截止。",
+            metadata={"owner": "张三", "deadline": "下周五", "tags": ["meeting_state", "action_item"]},
+        )
+    )
+    pending = service.upsert_candidate(
+        _candidate(
+            "李四负责客户报价确认，下周一截止。",
+            metadata={"owner": "李四", "deadline": "下周一", "tags": ["meeting_state", "action_item"]},
+        )
+    )
+    assert pending.pending_update is not None
+
+    reopened = MemoryService(SQLiteMemoryStore(db_path))
+    listed = reopened.list_pending_updates(memory_id=created.memory.memory_id)
+    applied = reopened.apply_pending_update(pending.pending_update.update_id, reason="confirmed after reopen")
+
+    assert [item.update_id for item in listed] == [pending.pending_update.update_id]
+    assert applied.memory.memory_id == created.memory.memory_id
+    assert applied.memory.metadata["owner"] == "李四"
+    assert applied.pending_update is not None
+    assert applied.pending_update.status == "applied"
+    assert applied.pending_update.resolved_reason == "confirmed after reopen"
+
+
+def test_sqlite_memory_forget_persists_redaction_and_pending_invalidation(tmp_path: Path) -> None:
+    db_path = tmp_path / "proactive.db"
+    service = MemoryService(SQLiteMemoryStore(db_path))
+    created = service.upsert_candidate(
+        _candidate(
+            "张三负责客户报价确认，下周五截止。",
+            metadata={"owner": "张三", "deadline": "下周五", "tags": ["meeting_state", "action_item"]},
+        )
+    )
+    pending = service.upsert_candidate(
+        _candidate(
+            "李四负责客户报价确认，下周一截止。",
+            metadata={"owner": "李四", "deadline": "下周一", "tags": ["meeting_state", "action_item"]},
+        )
+    )
+    assert pending.pending_update is not None
+
+    forgotten = service.forget_memory(created.memory.memory_id, reason="privacy deletion")
+    reopened = MemoryService(SQLiteMemoryStore(db_path))
+    stored_tombstones = reopened.store.list_memories(MemoryQuery(include_forgotten=True, limit=10))
+    active_context = reopened.search_context(
+        MemoryQuery(
+            org_id="default_org",
+            user_id="default_user",
+            session_id="session_sqlite_001",
+            query_text="客户报价确认",
+            limit=10,
+        )
+    )
+    updates = reopened.list_pending_updates(memory_id=created.memory.memory_id, status=None)
+
+    assert forgotten.memory.write_status == "forgotten"
+    assert forgotten.invalidated_pending_updates[0].status == "rejected"
+    assert stored_tombstones[0].memory_id == created.memory.memory_id
+    assert stored_tombstones[0].text == "[forgotten]"
+    assert stored_tombstones[0].metadata["forget_reason"] == "privacy deletion"
+    assert active_context.memory_refs == []
+    assert updates[0].status == "rejected"
+    assert updates[0].resolved_reason == "memory forgotten: privacy deletion"
+
+
 def test_sqlite_product_flow_persists_runtime_and_memory_after_reopen(tmp_path: Path) -> None:
     db_path = tmp_path / "proactive.db"
     service = _product_service(db_path)
@@ -165,6 +236,21 @@ def _product_service(db_path: Path) -> ProductAssistantService:
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=PromptRuntimeService(SQLiteRuntimeStore(db_path)),
         memory_service=MemoryService(SQLiteMemoryStore(db_path)),
+    )
+
+
+def _candidate(text: str, *, metadata: dict[str, Any]) -> MemoryCandidate:
+    return MemoryCandidate(
+        memory_candidate_id="memcand_sqlite_action",
+        decision_id="decision_sqlite_snapshot",
+        session_id="session_sqlite_001",
+        source_event_ids=[],
+        candidate_type=MemoryCandidateType.ACTION_ITEM,
+        text=text,
+        confidence=0.8,
+        write_policy=MemoryWritePolicy.ELIGIBLE,
+        reason="sqlite pending update test",
+        metadata=metadata,
     )
 
 

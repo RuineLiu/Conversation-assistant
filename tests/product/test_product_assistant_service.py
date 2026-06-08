@@ -1,7 +1,18 @@
 from typing import Any
+from datetime import UTC, datetime
 
 from proactive_assistant.meeting_state import MeetingGapType
-from proactive_assistant.memory import MemoryQuery, MemoryRetrievalIntent
+from proactive_assistant.memory import (
+    MemoryRecord,
+    MemoryExtractionService,
+    MemoryQuery,
+    MemoryRetrievalIntent,
+    MemoryScope,
+    MemorySource,
+    MemoryType,
+    MemoryUpdatePolicyDecision,
+    MemoryUpsertStatus,
+)
 from proactive_assistant.model_gateway import FakeModelClient, ModelRequest
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptOrchestrator
@@ -163,6 +174,118 @@ def test_product_flow_writes_meeting_state_snapshot_memory_once_and_supports_exa
     assert context.results[0].intent == MemoryRetrievalIntent.LOOKUP_DEADLINE.value
 
 
+def test_product_flow_extracts_llm_memory_candidates_and_upserts_them() -> None:
+    prompt_client = FakeModelClient(valid_prompt_response())
+    extraction_client = FakeModelClient(
+        {
+            "candidates": [
+                {
+                    "candidate_type": "action_item",
+                    "text": "张三负责客户报价确认，下周五截止。",
+                    "confidence": 0.84,
+                    "write_policy": "eligible",
+                    "privacy_level": "medium",
+                    "privacy_risk": 0.35,
+                    "source_refs": ["transcript:seg_0"],
+                    "reason": "明确出现负责人和截止时间。",
+                    "entity": "客户报价确认",
+                    "owner": "张三",
+                    "deadline": "下周五",
+                    "status": "open",
+                    "topic": "客户报价",
+                    "tags": ["action_item"],
+                    "promotion_candidate": False,
+                }
+            ],
+            "extraction_notes": "extracted action item",
+            "safety_flags": [],
+        }
+    )
+    service = ProductAssistantService(
+        session_service=SessionService(InMemorySessionStore()),
+        prompt_orchestrator=PromptOrchestrator(
+            prompt_service=PromptGenerationService(
+                model_client=prompt_client,
+                settings=ModelGatewaySettings(default_model="gpt-test"),
+            )
+        ),
+        runtime_service=PromptRuntimeService(),
+        memory_extraction_service=MemoryExtractionService(
+            model_client=extraction_client,
+            settings=ModelGatewaySettings(default_model="gpt-memory-test"),
+        ),
+    )
+    session = service.create_session(
+        SessionConfig(
+            title="Customer pricing sync",
+            metadata={"org_id": "org_001", "subject_user_id": "user_001"},
+        ),
+        session_id="session_001",
+    )
+    service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("张三负责客户报价确认，下周五截止。"),
+        segment_id="seg_0",
+    )
+
+    extraction = service.extract_session_memories(session.session_id)
+
+    assert len(extraction.memory_candidates) == 1
+    assert extraction.memory_candidates[0].candidate_type == MemoryCandidateType.ACTION_ITEM.value
+    assert extraction.memory_candidates[0].metadata["owner"] == "张三"
+    assert extraction.memory_upserts[0].status == MemoryUpsertStatus.CREATED.value
+    assert extraction.memories[0].memory_type == "action_item"
+    assert extraction.memories[0].metadata["memory_extraction_source"] == "llm_memory_extraction_v1"
+    assert extraction.memories[0].metadata["owner"] == "张三"
+    assert extraction.model_usage is not None
+    assert extraction.model_usage.model == "gpt-memory-test"
+    assert extraction_client.requests[0].metadata["contract"] == "memory_extraction_v1"
+
+
+def test_product_flow_requires_confirmation_for_sensitive_meeting_state_snapshot_update() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(
+        SessionConfig(
+            title="Customer pricing sync",
+            metadata={"org_id": "org_001", "subject_user_id": "user_001"},
+        ),
+        session_id="session_001",
+    )
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("张三负责客户报价确认，下周五截止。"),
+        segment_id="seg_0",
+    )
+
+    first_snapshot = service.write_meeting_state_memory_snapshot(session.session_id, include_gaps=False)
+    action_memory = first_snapshot.memories[0]
+    action_item = step.meeting_state.action_items[0]
+    updated_action_item = action_item.model_copy(
+        update={
+            "owner": "李四",
+            "deadline": "下周一",
+            "evidence": "李四负责客户报价确认，下周一截止。",
+            "desc": "李四负责客户报价确认，下周一截止。",
+        }
+    )
+    service._meeting_states[session.session_id] = step.meeting_state.model_copy(update={"action_items": [updated_action_item]})
+
+    second_snapshot = service.write_meeting_state_memory_snapshot(session.session_id, include_gaps=False)
+    stored = service.memory.store.list_memories(MemoryQuery(session_id=session.session_id, include_pending=True, limit=20))
+
+    assert second_snapshot.memory_upserts[0].status == MemoryUpsertStatus.UNCHANGED.value
+    assert second_snapshot.memory_upserts[0].update_policy == MemoryUpdatePolicyDecision.NEEDS_CONFIRMATION.value
+    assert second_snapshot.memories[0].memory_id == action_memory.memory_id
+    assert second_snapshot.memories[0].metadata["memory_version"] == 1
+    assert second_snapshot.memories[0].metadata["owner"] == "张三"
+    assert second_snapshot.memories[0].metadata["deadline"] == "下周五"
+    assert second_snapshot.memory_upserts[0].proposed_memory is not None
+    assert second_snapshot.memory_upserts[0].proposed_memory.metadata["owner"] == "李四"
+    assert second_snapshot.memory_upserts[0].proposed_memory.metadata["deadline"] == "下周一"
+    assert "metadata.owner" in second_snapshot.memory_upserts[0].changed_fields
+    assert len(stored) == 1
+
+
 def test_product_feedback_can_skip_reward_and_memory_generation() -> None:
     service, _client = make_product_service()
     session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
@@ -219,6 +342,56 @@ def test_product_flow_retrieves_confirmed_memory_into_next_prompt_snapshot() -> 
     assert second.retrieved_memory_context.memory_refs == [f"memory:{memory.memory_id}"]
     assert second.snapshot.memory_refs == [f"memory:{memory.memory_id}"]
     assert second.snapshot.memory_context[0].startswith(f"[memory:{memory.memory_id}]")
+
+
+def test_product_flow_records_memory_context_on_decision_metadata() -> None:
+    def response_for_request(request: ModelRequest) -> dict[str, Any]:
+        assert "张三负责客户报价确认" in request.input_text
+        return valid_prompt_response()
+
+    service, client = make_product_service()
+    client._response = response_for_request
+    session = service.create_session(
+        SessionConfig(
+            title="Customer pricing sync",
+            metadata={"org_id": "org_001", "subject_user_id": "user_001"},
+        ),
+        session_id="session_001",
+    )
+    created_at = datetime(2026, 6, 5, tzinfo=UTC)
+    service.memory.store.add_memory(
+        MemoryRecord(
+            memory_id="mem_customer_pricing_owner",
+            memory_type=MemoryType.ACTION_ITEM,
+            scope=MemoryScope.SESSION,
+            text="张三负责客户报价确认，下周五截止。",
+            org_id="org_001",
+            user_id="user_001",
+            session_id=session.session_id,
+            source=MemorySource.MANUAL,
+            source_ids=["manual:pricing_owner"],
+            confidence=0.9,
+            importance=0.9,
+            tags=["客户报价确认", "owner", "deadline"],
+            created_at=created_at,
+            updated_at=created_at,
+            metadata={"entity": "客户报价确认", "owner": "张三", "deadline": "下周五"},
+        )
+    )
+
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("客户报价确认这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+
+    assert step.snapshot.memory_refs == ["memory:mem_customer_pricing_owner"]
+    assert step.decisions[0].metadata["memory_refs"] == ["memory:mem_customer_pricing_owner"]
+    assert step.decisions[0].metadata["retrieved_memory_refs"] == ["memory:mem_customer_pricing_owner"]
+    assert step.decisions[0].metadata["retrieved_memory_result_count"] == 1
+    assert step.decisions[0].metadata["memory_query_prompt_category"] == "summary_gap_check"
+    assert "客户报价确认" in step.decisions[0].metadata["memory_query_text"]
+    assert client.requests[0].metadata["session_id"] == session.session_id
 
 
 def test_product_flow_handles_suppressed_prompt_candidate() -> None:

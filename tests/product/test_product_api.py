@@ -7,6 +7,7 @@ from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptOrchestrator
 from proactive_assistant.product.api import create_app
 from proactive_assistant.product.service import ProductAssistantService
+from proactive_assistant.memory import MemoryExtractionService
 from proactive_assistant.prompting import PromptGenerationService
 from proactive_assistant.runtime import PromptRuntimeService
 from proactive_assistant.sessions import InMemorySessionStore, SessionService
@@ -31,16 +32,57 @@ def valid_prompt_response(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def create_client(response: dict[str, Any] | None = None) -> TestClient:
+def valid_memory_extraction_response(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "candidates": [
+            {
+                "candidate_type": "action_item",
+                "text": "张三负责客户报价确认，下周五截止。",
+                "confidence": 0.84,
+                "write_policy": "eligible",
+                "privacy_level": "medium",
+                "privacy_risk": 0.35,
+                "source_refs": ["transcript:seg_action"],
+                "reason": "明确出现负责人和截止时间。",
+                "entity": "客户报价确认",
+                "owner": "张三",
+                "deadline": "下周五",
+                "status": "open",
+                "topic": "客户报价",
+                "tags": ["action_item"],
+                "promotion_candidate": False,
+            }
+        ],
+        "extraction_notes": "extracted action item",
+        "safety_flags": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def create_client(
+    response: dict[str, Any] | None = None,
+    *,
+    extraction_response: dict[str, Any] | None = None,
+) -> TestClient:
     model_client = FakeModelClient(response or valid_prompt_response())
     prompt_service = PromptGenerationService(
         model_client=model_client,
         settings=ModelGatewaySettings(default_model="gpt-test"),
     )
+    memory_extraction_service = (
+        MemoryExtractionService(
+            model_client=FakeModelClient(extraction_response),
+            settings=ModelGatewaySettings(default_model="gpt-memory-test"),
+        )
+        if extraction_response is not None
+        else None
+    )
     service = ProductAssistantService(
         session_service=SessionService(InMemorySessionStore()),
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=PromptRuntimeService(),
+        memory_extraction_service=memory_extraction_service,
     )
     app = create_app(service)
     app.state.fake_model_client = model_client
@@ -236,6 +278,7 @@ def test_memory_snapshot_endpoint_can_preview_and_commit_meeting_state_memories(
 
     preview = client.post("/sessions/session_api_001/memory-snapshot", json={"commit": False})
     committed = client.post("/sessions/session_api_001/memory-snapshot")
+    repeated = client.post("/sessions/session_api_001/memory-snapshot")
 
     assert preview.status_code == 200
     assert preview.json()["committed"] is False
@@ -245,7 +288,207 @@ def test_memory_snapshot_endpoint_can_preview_and_commit_meeting_state_memories(
     assert committed.json()["committed"] is True
     assert committed.json()["memory_candidates"]
     assert committed.json()["memories"]
+    assert committed.json()["memory_upserts"][0]["status"] == "created"
     assert committed.json()["memories"][0]["metadata"]["memory_snapshot_source"] == "meeting_state_snapshot_v1"
+    assert repeated.status_code == 200
+    assert repeated.json()["memory_upserts"][0]["status"] == "unchanged"
+
+
+def test_memory_extraction_endpoint_extracts_and_commits_llm_candidates() -> None:
+    client = create_client(extraction_response=valid_memory_extraction_response())
+    create_session(client)
+    transcript_response = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment_id": "seg_action",
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "张三负责客户报价确认，下周五截止。",
+                "asr_confidence": 0.94,
+            },
+        },
+    )
+    assert transcript_response.status_code == 200
+
+    response = client.post(
+        "/sessions/session_api_001/memory-extraction",
+        json={"commit": True, "max_segments": 12, "max_candidates": 4},
+    )
+    context = client.get("/sessions/session_api_001/memory-context?query_text=客户报价确认&include_pending=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["committed"] is True
+    assert payload["memory_candidates"][0]["candidate_type"] == "action_item"
+    assert payload["memory_candidates"][0]["metadata"]["owner"] == "张三"
+    assert payload["memory_upserts"][0]["status"] == "created"
+    assert payload["memories"][0]["metadata"]["memory_extraction_source"] == "llm_memory_extraction_v1"
+    assert payload["model_usage"]["model"] == "gpt-memory-test"
+    assert context.status_code == 200
+    assert context.json()["memory_context"]["memory_refs"] == [f"memory:{payload['memories'][0]['memory_id']}"]
+
+
+def test_memory_pending_update_endpoints_apply_sensitive_snapshot_update() -> None:
+    client = create_client()
+    create_session(client)
+    transcript_response = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment_id": "seg_action",
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "张三负责客户报价确认，下周五截止。",
+                "asr_confidence": 0.94,
+            },
+        },
+    )
+    assert transcript_response.status_code == 200
+    committed = client.post("/sessions/session_api_001/memory-snapshot", json={"include_gaps": False})
+    memory_id = committed.json()["memories"][0]["memory_id"]
+
+    service = client.app.state.product_service
+    state = service.get_meeting_state("session_api_001")
+    action_item = state.action_items[0]
+    service._meeting_states["session_api_001"] = state.model_copy(
+        update={
+            "action_items": [
+                action_item.model_copy(
+                    update={
+                        "owner": "李四",
+                        "deadline": "下周一",
+                        "desc": "李四负责客户报价确认，下周一截止。",
+                        "evidence": "李四负责客户报价确认，下周一截止。",
+                    }
+                )
+            ]
+        }
+    )
+
+    proposed = client.post("/sessions/session_api_001/memory-snapshot", json={"include_gaps": False})
+    pending_update = proposed.json()["memory_upserts"][0]["pending_update"]
+    listed = client.get(f"/memories/{memory_id}/pending-updates")
+    applied = client.post(f"/memory-updates/{pending_update['update_id']}/apply", json={"reason": "confirmed in test"})
+    remaining = client.get(f"/memories/{memory_id}/pending-updates")
+
+    assert proposed.status_code == 200
+    assert proposed.json()["memory_upserts"][0]["update_policy"] == "needs_confirmation"
+    assert pending_update["status"] == "pending"
+    assert listed.status_code == 200
+    assert listed.json()["pending_updates"][0]["update_id"] == pending_update["update_id"]
+    assert applied.status_code == 200
+    applied_memory = applied.json()["memory_upsert"]["memory"]
+    assert applied.json()["memory_upsert"]["status"] == "updated"
+    assert applied.json()["memory_upsert"]["pending_update"]["status"] == "applied"
+    assert applied_memory["metadata"]["owner"] == "李四"
+    assert applied_memory["metadata"]["deadline"] == "下周一"
+    assert remaining.status_code == 200
+    assert remaining.json()["pending_updates"] == []
+
+
+def test_memory_delete_endpoint_forgets_memory_and_invalidates_pending_update() -> None:
+    client = create_client()
+    create_session(client)
+    transcript_response = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment_id": "seg_action",
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "张三负责客户报价确认，下周五截止。",
+                "asr_confidence": 0.94,
+            },
+        },
+    )
+    assert transcript_response.status_code == 200
+    committed = client.post("/sessions/session_api_001/memory-snapshot", json={"include_gaps": False})
+    memory_id = committed.json()["memories"][0]["memory_id"]
+
+    service = client.app.state.product_service
+    state = service.get_meeting_state("session_api_001")
+    action_item = state.action_items[0]
+    service._meeting_states["session_api_001"] = state.model_copy(
+        update={
+            "action_items": [
+                action_item.model_copy(
+                    update={
+                        "owner": "李四",
+                        "deadline": "下周一",
+                        "desc": "李四负责客户报价确认，下周一截止。",
+                        "evidence": "李四负责客户报价确认，下周一截止。",
+                    }
+                )
+            ]
+        }
+    )
+    proposed = client.post("/sessions/session_api_001/memory-snapshot", json={"include_gaps": False})
+    pending_update = proposed.json()["memory_upserts"][0]["pending_update"]
+
+    deleted = client.delete(f"/memories/{memory_id}", params={"reason": "user requested deletion"})
+    context = client.get("/sessions/session_api_001/memory-context?query_text=客户报价确认")
+    rejected_updates = client.get(f"/memories/{memory_id}/pending-updates?status=rejected")
+    stale_apply = client.post(f"/memory-updates/{pending_update['update_id']}/apply")
+
+    assert deleted.status_code == 200
+    payload = deleted.json()["memory_forget"]
+    assert payload["memory"]["write_status"] == "forgotten"
+    assert payload["memory"]["text"] == "[forgotten]"
+    assert payload["memory"]["metadata"]["forget_reason"] == "user requested deletion"
+    assert payload["invalidated_pending_updates"][0]["update_id"] == pending_update["update_id"]
+    assert payload["invalidated_pending_updates"][0]["status"] == "rejected"
+    assert context.status_code == 200
+    assert context.json()["memory_context"]["memory_refs"] == []
+    assert rejected_updates.status_code == 200
+    assert rejected_updates.json()["pending_updates"][0]["resolved_reason"] == "memory forgotten: user requested deletion"
+    assert stale_apply.status_code == 409
+
+
+def test_memory_promote_endpoint_makes_approved_memory_visible_to_later_session() -> None:
+    client = create_client()
+    create_session(client)
+    transcript_response = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment_id": "seg_action",
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "张三负责客户报价确认，下周五截止。",
+                "asr_confidence": 0.94,
+            },
+        },
+    )
+    assert transcript_response.status_code == 200
+    snapshot = client.post("/sessions/session_api_001/memory-snapshot", json={"include_gaps": False})
+    memory_id = snapshot.json()["memories"][0]["memory_id"]
+
+    proposed = client.post(
+        f"/memories/{memory_id}/promote",
+        json={"target_scope": "org", "reason": "action item needs review"},
+    )
+    approved = client.post(
+        f"/memories/{memory_id}/promote",
+        json={"target_scope": "org", "reason": "approved for recurring project context", "approved": True},
+    )
+    create_session(client, session_id="session_api_002")
+    context = client.get("/sessions/session_api_002/memory-context?query_text=客户报价确认")
+
+    assert proposed.status_code == 200
+    assert proposed.json()["memory_promotion"]["status"] == "needs_confirmation"
+    assert proposed.json()["memory_promotion"]["promoted_memory"] is None
+    assert approved.status_code == 200
+    assert approved.json()["memory_promotion"]["status"] == "promoted"
+    promoted_memory = approved.json()["memory_promotion"]["promoted_memory"]
+    assert promoted_memory["scope"] == "org"
+    assert promoted_memory["source"] == "promoted"
+    assert context.status_code == 200
+    assert context.json()["memory_context"]["memory_refs"] == [f"memory:{promoted_memory['memory_id']}"]
 
 
 def test_reject_and_archive_memory_endpoints_hide_memory_context() -> None:

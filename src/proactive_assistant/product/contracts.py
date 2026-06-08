@@ -1,8 +1,15 @@
 from pydantic import BaseModel, ConfigDict, Field
 
 from proactive_assistant.meeting_state import MeetingGap, MeetingState
-from proactive_assistant.memory import MemoryContext, MemoryRecord
-from proactive_assistant.prompting import ContentGranularity, DisplayMode, DurationPolicy, PRDSurface, PrivacyLevel
+from proactive_assistant.memory import MemoryContext, MemoryRecord, MemoryUpsertResult
+from proactive_assistant.prompting import (
+    ContentGranularity,
+    DisplayMode,
+    DurationPolicy,
+    ModelUsageMetadata,
+    PRDSurface,
+    PrivacyLevel,
+)
 from proactive_assistant.runtime import (
     MemoryCandidate,
     PromptDecisionDisplayStatus,
@@ -70,4 +77,18 @@ class ProductMemorySnapshotResult(BaseModel):
     meeting_state: MeetingState
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     memories: list[MemoryRecord] = Field(default_factory=list)
+    memory_upserts: list[MemoryUpsertResult] = Field(default_factory=list)
     committed: bool = True
+
+
+class ProductMemoryExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session: AssistantSession
+    memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
+    memories: list[MemoryRecord] = Field(default_factory=list)
+    memory_upserts: list[MemoryUpsertResult] = Field(default_factory=list)
+    committed: bool = True
+    extraction_notes: str = ""
+    safety_flags: list[str] = Field(default_factory=list)
+    model_usage: ModelUsageMetadata | None = None

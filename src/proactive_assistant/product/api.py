@@ -6,14 +6,29 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from proactive_assistant.meeting_state import MeetingGap, MeetingState
-from proactive_assistant.memory import MemoryContext, MemoryNotFoundError, MemoryRecord, MemoryService
+from proactive_assistant.memory import (
+    MemoryContext,
+    MemoryExtractionService,
+    MemoryForgetResult,
+    MemoryNotFoundError,
+    MemoryPendingUpdate,
+    MemoryPendingUpdateNotFoundError,
+    MemoryPendingUpdateStatus,
+    MemoryPromotionResult,
+    MemoryRecord,
+    MemoryScope,
+    MemoryService,
+    MemoryType,
+    MemoryUpsertResult,
+)
 from proactive_assistant.model_gateway import (
+    ModelGatewayError,
     ModelGatewaySettings,
     OpenAIChatCompletionsClient,
     OpenAIResponsesClient,
 )
 from proactive_assistant.orchestration import PromptOrchestrator
-from proactive_assistant.product.contracts import ProductPromptPayload
+from proactive_assistant.product.contracts import ProductMemoryExtractionResult, ProductPromptPayload
 from proactive_assistant.product.service import ProductAssistantService
 from proactive_assistant.prompting import PRDSurface, PromptCategory, PromptGenerationService
 from proactive_assistant.persistence import SQLiteMemoryStore, SQLiteRuntimeStore, SQLiteSessionStore
@@ -172,7 +187,19 @@ class MemorySnapshotResponse(BaseModel):
     session_id: str
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     memories: list[MemoryRecord] = Field(default_factory=list)
+    memory_upserts: list[MemoryUpsertResult] = Field(default_factory=list)
     committed: bool = True
+
+
+class MemoryExtractionRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    commit: bool = True
+    max_segments: int = Field(default=24, ge=1, le=200)
+    max_candidates: int = Field(default=8, ge=1, le=20)
+    include_meeting_state: bool = True
+    memory_context: list[str] = Field(default_factory=list)
+    model: str | None = None
 
 
 class MemoryMutationRequest(BaseModel):
@@ -185,6 +212,47 @@ class MemoryMutationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     memory: MemoryRecord
+
+
+class MemoryForgetResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_forget: MemoryForgetResult
+
+
+class MemoryPendingUpdateListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    memory_id: str
+    status: MemoryPendingUpdateStatus | None = None
+    pending_updates: list[MemoryPendingUpdate] = Field(default_factory=list)
+
+
+class MemoryPendingUpdateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pending_update: MemoryPendingUpdate
+
+
+class MemoryPendingUpdateApplyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_upsert: MemoryUpsertResult
+
+
+class MemoryPromotionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+
+    target_scope: MemoryScope | None = None
+    target_memory_type: MemoryType | None = None
+    reason: str = ""
+    approved: bool = False
+
+
+class MemoryPromotionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_promotion: MemoryPromotionResult
 
 
 def create_app(product_service: ProductAssistantService | None = None) -> FastAPI:
@@ -370,8 +438,33 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             session_id=result.session.session_id,
             memory_candidates=result.memory_candidates,
             memories=result.memories,
+            memory_upserts=result.memory_upserts,
             committed=result.committed,
         )
+
+    @app.post("/sessions/{session_id}/memory-extraction", response_model=ProductMemoryExtractionResult)
+    def extract_session_memories(
+        session_id: str,
+        request: MemoryExtractionRequestBody | None = None,
+    ) -> ProductMemoryExtractionResult:
+        resolved_request = request or MemoryExtractionRequestBody()
+        try:
+            return service.extract_session_memories(
+                session_id,
+                commit=resolved_request.commit,
+                max_segments=resolved_request.max_segments,
+                max_candidates=resolved_request.max_candidates,
+                include_meeting_state=resolved_request.include_meeting_state,
+                memory_context=resolved_request.memory_context,
+                model=resolved_request.model,
+            )
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModelGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 503 if "not configured" in str(exc) else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @app.post("/memories/{memory_id}/confirm", response_model=MemoryMutationResponse)
     def confirm_memory(memory_id: str) -> MemoryMutationResponse:
@@ -379,6 +472,8 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             return MemoryMutationResponse(memory=service.confirm_memory(memory_id))
         except MemoryNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/memories/{memory_id}/reject", response_model=MemoryMutationResponse)
     def reject_memory(memory_id: str, request: MemoryMutationRequest | None = None) -> MemoryMutationResponse:
@@ -386,6 +481,8 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             return MemoryMutationResponse(memory=service.reject_memory(memory_id, reason=(request or MemoryMutationRequest()).reason))
         except MemoryNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/memories/{memory_id}/archive", response_model=MemoryMutationResponse)
     def archive_memory(memory_id: str, request: MemoryMutationRequest | None = None) -> MemoryMutationResponse:
@@ -393,14 +490,86 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             return MemoryMutationResponse(memory=service.archive_memory(memory_id, reason=(request or MemoryMutationRequest()).reason))
         except MemoryNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/memories/{memory_id}", response_model=MemoryForgetResponse)
+    def forget_memory(memory_id: str, reason: str = Query(default="")) -> MemoryForgetResponse:
+        try:
+            return MemoryForgetResponse(memory_forget=service.forget_memory(memory_id, reason=reason))
+        except MemoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/memories/{memory_id}/promote", response_model=MemoryPromotionResponse)
+    def promote_memory(memory_id: str, request: MemoryPromotionRequest | None = None) -> MemoryPromotionResponse:
+        resolved_request = request or MemoryPromotionRequest()
+        try:
+            result = service.promote_memory(
+                memory_id,
+                target_scope=resolved_request.target_scope,
+                target_memory_type=resolved_request.target_memory_type,
+                reason=resolved_request.reason,
+                approved=resolved_request.approved,
+            )
+        except MemoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return MemoryPromotionResponse(memory_promotion=result)
+
+    @app.get("/memories/{memory_id}/pending-updates", response_model=MemoryPendingUpdateListResponse)
+    def list_memory_pending_updates(
+        memory_id: str,
+        status: MemoryPendingUpdateStatus | None = Query(default=MemoryPendingUpdateStatus.PENDING),
+    ) -> MemoryPendingUpdateListResponse:
+        try:
+            service.memory.store.get_memory(memory_id)
+        except MemoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return MemoryPendingUpdateListResponse(
+            memory_id=memory_id,
+            status=status,
+            pending_updates=service.list_pending_memory_updates(memory_id=memory_id, status=status),
+        )
+
+    @app.post("/memory-updates/{update_id}/apply", response_model=MemoryPendingUpdateApplyResponse)
+    def apply_memory_pending_update(
+        update_id: str,
+        request: MemoryMutationRequest | None = None,
+    ) -> MemoryPendingUpdateApplyResponse:
+        try:
+            result = service.apply_pending_memory_update(update_id, reason=(request or MemoryMutationRequest()).reason)
+        except MemoryPendingUpdateNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return MemoryPendingUpdateApplyResponse(memory_upsert=result)
+
+    @app.post("/memory-updates/{update_id}/reject", response_model=MemoryPendingUpdateResponse)
+    def reject_memory_pending_update(
+        update_id: str,
+        request: MemoryMutationRequest | None = None,
+    ) -> MemoryPendingUpdateResponse:
+        try:
+            pending_update = service.reject_pending_memory_update(update_id, reason=(request or MemoryMutationRequest()).reason)
+        except MemoryPendingUpdateNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return MemoryPendingUpdateResponse(pending_update=pending_update)
 
     return app
 
 
 def create_default_product_service(settings: ModelGatewaySettings | None = None) -> ProductAssistantService:
     resolved_settings = settings or ModelGatewaySettings()
+    model_client = _build_model_client(resolved_settings)
     prompt_service = PromptGenerationService(
-        model_client=_build_model_client(resolved_settings),
+        model_client=model_client,
+        settings=resolved_settings,
+    )
+    memory_extraction_service = MemoryExtractionService(
+        model_client=model_client,
         settings=resolved_settings,
     )
     session_store, runtime_service, memory_service = _build_storage_services()
@@ -409,6 +578,7 @@ def create_default_product_service(settings: ModelGatewaySettings | None = None)
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=runtime_service,
         memory_service=memory_service,
+        memory_extraction_service=memory_extraction_service,
     )
 
 

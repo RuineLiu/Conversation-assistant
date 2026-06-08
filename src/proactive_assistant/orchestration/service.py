@@ -44,18 +44,33 @@ class PromptOrchestrator:
         *,
         extra_opportunities: list[PromptOpportunity] | None = None,
     ) -> PromptOrchestrationResult:
-        detection_result = self._detector.detect(snapshot)
-        opportunities = _select_opportunities(
-            [*detection_result.opportunities, *(extra_opportunities or [])],
-            max_opportunities=self._max_candidates,
-        )
-        candidates = [self._generate_candidate(snapshot, opportunity) for opportunity in opportunities]
+        opportunities = self.select_opportunities(snapshot, extra_opportunities=extra_opportunities)
+        candidates = [self.generate_candidate(snapshot, opportunity) for opportunity in opportunities]
         return PromptOrchestrationResult(
             session_id=snapshot.session_id,
             snapshot=snapshot,
             opportunities=opportunities,
             candidates=candidates,
         )
+
+    def select_opportunities(
+        self,
+        snapshot: SessionContextSnapshot,
+        *,
+        extra_opportunities: list[PromptOpportunity] | None = None,
+    ) -> list[PromptOpportunity]:
+        detection_result = self._detector.detect(snapshot)
+        return _select_opportunities(
+            [*detection_result.opportunities, *(extra_opportunities or [])],
+            max_opportunities=self._max_candidates,
+        )
+
+    def generate_candidate(
+        self,
+        snapshot: SessionContextSnapshot,
+        opportunity: PromptOpportunity,
+    ) -> PromptCandidate:
+        return self._generate_candidate(snapshot, opportunity)
 
     def _generate_candidate(
         self,

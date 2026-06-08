@@ -2,6 +2,7 @@
 
 from proactive_assistant.product.contracts import (
     ProductFeedbackResult,
+    ProductMemoryExtractionResult,
     ProductMemorySnapshotResult,
     ProductPromptPayload,
     ProductTranscriptStepResult,
@@ -12,6 +13,7 @@ from proactive_assistant.product.service import ProductAssistantService, prompt_
 __all__ = [
     "ProductAssistantService",
     "ProductFeedbackResult",
+    "ProductMemoryExtractionResult",
     "ProductMemorySnapshotResult",
     "ProductPromptPayload",
     "ProductTranscriptStepResult",

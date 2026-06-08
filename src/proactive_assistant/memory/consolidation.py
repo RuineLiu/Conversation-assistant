@@ -67,6 +67,8 @@ def consolidated_memory_metadata(candidate: MemoryCandidate) -> dict[str, Any]:
             "canonical_entity",
             "normalized_entity",
             "provenance",
+            "source_refs",
+            "memory_extraction_source",
             "memory_snapshot_source",
             "meeting_state_object_type",
             "meeting_state_object_id",
@@ -85,7 +87,14 @@ def consolidated_memory_metadata(candidate: MemoryCandidate) -> dict[str, Any]:
         metadata.setdefault("provenance", provenance)
     if candidate_type == MemoryCandidateType.ACTION_ITEM:
         _fill_action_metadata(candidate.text, metadata, _reference_time(original))
-    elif candidate_type in {MemoryCandidateType.MEETING_FACT, MemoryCandidateType.USER_PREFERENCE}:
+    elif candidate_type in {
+        MemoryCandidateType.MEETING_FACT,
+        MemoryCandidateType.USER_PREFERENCE,
+        MemoryCandidateType.DECISION,
+        MemoryCandidateType.PERSON_OR_FACT,
+        MemoryCandidateType.PROJECT_CONTEXT,
+        MemoryCandidateType.SUMMARY,
+    }:
         _fill_general_metadata(candidate.text, metadata, _reference_time(original))
     elif candidate_type == MemoryCandidateType.PRIVACY_PREFERENCE:
         metadata.setdefault("feedback_affinity", 0.9)

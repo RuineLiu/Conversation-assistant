@@ -206,3 +206,30 @@ def test_archive_memory_hides_record_by_default() -> None:
     assert archived.metadata["archive_reason"] == "user revoked"
     assert store.list_memories() == []
     assert store.list_memories(MemoryQuery(include_archived=True))[0].memory_id == "mem_001"
+
+
+def test_forget_memory_redacts_record_and_hides_from_all_default_queries() -> None:
+    store = InMemoryMemoryStore()
+    store.add_memory(
+        memory(
+            "mem_sensitive",
+            "客户报价信息。",
+            privacy_level=PrivacyLevel.HIGH,
+            tags=["pricing", "customer"],
+        )
+    )
+
+    forgotten = store.forget_memory("mem_sensitive", reason="user requested deletion")
+
+    assert forgotten.write_status == MemoryWriteStatus.FORGOTTEN.value
+    assert forgotten.text == "[forgotten]"
+    assert forgotten.source_ids == []
+    assert forgotten.tags == ["forgotten"]
+    assert forgotten.confidence == 0.0
+    assert forgotten.importance == 0.0
+    assert forgotten.metadata["forgotten"] is True
+    assert forgotten.metadata["forget_reason"] == "user requested deletion"
+    assert "pricing" not in str(forgotten.metadata)
+    assert store.list_memories(MemoryQuery(query_text="客户报价", include_archived=True, limit=10)) == []
+    assert store.search_memories(MemoryQuery(query_text="客户报价", include_forgotten=True, limit=10)) == []
+    assert store.list_memories(MemoryQuery(include_forgotten=True, limit=10))[0].memory_id == "mem_sensitive"

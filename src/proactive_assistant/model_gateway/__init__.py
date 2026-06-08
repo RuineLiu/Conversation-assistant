@@ -10,10 +10,19 @@ from proactive_assistant.model_gateway.clients import (
     OpenAIChatCompletionsClient,
     OpenAIResponsesClient,
 )
+from proactive_assistant.model_gateway.embeddings import (
+    EmbeddingClient,
+    EmbeddingResponse,
+    FakeEmbeddingClient,
+    OpenAIEmbeddingClient,
+)
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 
 __all__ = [
+    "EmbeddingClient",
+    "EmbeddingResponse",
     "FakeModelClient",
+    "FakeEmbeddingClient",
     "ModelClient",
     "ModelGatewayError",
     "ModelGatewaySettings",
@@ -21,5 +30,6 @@ __all__ = [
     "ModelRequest",
     "ModelResponse",
     "OpenAIChatCompletionsClient",
+    "OpenAIEmbeddingClient",
     "OpenAIResponsesClient",
 ]

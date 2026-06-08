@@ -58,6 +58,10 @@ class MemoryCandidateType(StrEnum):
     PRIVACY_PREFERENCE = "privacy_preference"
     MEETING_FACT = "meeting_fact"
     ACTION_ITEM = "action_item"
+    DECISION = "decision"
+    PERSON_OR_FACT = "person_or_fact"
+    PROJECT_CONTEXT = "project_context"
+    SUMMARY = "summary"
 
 
 class MemoryWritePolicy(StrEnum):

@@ -11,13 +11,25 @@ from pydantic import BaseModel
 from proactive_assistant.memory import (
     MemoryAlreadyExistsError,
     MemoryNotFoundError,
+    MemoryPendingUpdate,
+    MemoryPendingUpdateAlreadyExistsError,
+    MemoryPendingUpdateNotFoundError,
+    MemoryPendingUpdateStatus,
     MemoryQuery,
     MemoryRecord,
     MemoryRecordUpdate,
     MemorySearchResult,
     MemoryWriteStatus,
 )
-from proactive_assistant.memory.store import _matches_query, _score_memory, _score_reason, _sort_records, _terms
+from proactive_assistant.memory.vector_store import MemoryVectorRecord
+from proactive_assistant.memory.store import (
+    _forgotten_memory_update,
+    _matches_query,
+    _score_memory,
+    _score_reason,
+    _sort_records,
+    _terms,
+)
 from proactive_assistant.runtime import (
     MemoryCandidate,
     PromptDecisionRecord,
@@ -125,6 +137,29 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(org_id, user_id, row_id);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, row_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type_status ON memories(memory_type, write_status, row_id);
+
+CREATE TABLE IF NOT EXISTS memory_pending_updates (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    update_id TEXT UNIQUE NOT NULL,
+    memory_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_pending_updates_memory ON memory_pending_updates(memory_id, row_id);
+CREATE INDEX IF NOT EXISTS idx_memory_pending_updates_status ON memory_pending_updates(status, row_id);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE(memory_id, embedding_model)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model ON memory_embeddings(embedding_model, row_id);
 """
 
 
@@ -480,6 +515,77 @@ class SQLiteMemoryStore(SQLiteRepositoryBase):
             MemoryRecordUpdate(write_status=MemoryWriteStatus.ARCHIVED, metadata=metadata),
         )
 
+    def forget_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord:
+        memory = self._get_memory(memory_id)
+        return self.update_memory(memory_id, _forgotten_memory_update(memory, reason=reason))
+
+    def add_pending_update(self, update: MemoryPendingUpdate) -> MemoryPendingUpdate:
+        self._get_memory(update.memory_id)
+        try:
+            self._connection.execute(
+                """
+                INSERT INTO memory_pending_updates(update_id, memory_id, status, created_at, payload)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    update.update_id,
+                    update.memory_id,
+                    str(update.status),
+                    _dt(update.created_at),
+                    _dump_model(update),
+                ),
+            )
+            self._connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise MemoryPendingUpdateAlreadyExistsError(
+                f"pending memory update already exists: {update.update_id}"
+            ) from exc
+        return _clone_model(update)
+
+    def get_pending_update(self, update_id: str) -> MemoryPendingUpdate:
+        return _clone_model(self._get_pending_update(update_id))
+
+    def list_pending_updates(
+        self,
+        *,
+        memory_id: str | None = None,
+        status: MemoryPendingUpdateStatus | str | None = None,
+    ) -> list[MemoryPendingUpdate]:
+        where: list[str] = []
+        params: list[str] = []
+        if memory_id is not None:
+            where.append("memory_id = ?")
+            params.append(memory_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(MemoryPendingUpdateStatus(status).value)
+        sql = "SELECT payload FROM memory_pending_updates"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY row_id"
+        rows = self._connection.execute(sql, params).fetchall()
+        return [_load_model(row, MemoryPendingUpdate) for row in rows]
+
+    def update_pending_update_status(
+        self,
+        update_id: str,
+        status: MemoryPendingUpdateStatus | str,
+        *,
+        reason: str = "",
+    ) -> MemoryPendingUpdate:
+        update = self._get_pending_update(update_id)
+        resolved_status = MemoryPendingUpdateStatus(status)
+        updated = update.model_copy(
+            update={
+                "status": resolved_status,
+                "resolved_at": _now() if resolved_status != MemoryPendingUpdateStatus.PENDING else None,
+                "resolved_reason": reason,
+            }
+        )
+        updated = MemoryPendingUpdate.model_validate(updated.model_dump(mode="python"))
+        self._write_pending_update(updated)
+        return _clone_model(updated)
+
     def _get_memory(self, memory_id: str) -> MemoryRecord:
         row = self._connection.execute("SELECT payload FROM memories WHERE memory_id = ?", (memory_id,)).fetchone()
         if row is None:
@@ -511,6 +617,91 @@ class SQLiteMemoryStore(SQLiteRepositoryBase):
         self._connection.commit()
         if cursor.rowcount == 0:
             raise MemoryNotFoundError(f"memory not found: {memory.memory_id}")
+
+    def _get_pending_update(self, update_id: str) -> MemoryPendingUpdate:
+        row = self._connection.execute(
+            "SELECT payload FROM memory_pending_updates WHERE update_id = ?",
+            (update_id,),
+        ).fetchone()
+        if row is None:
+            raise MemoryPendingUpdateNotFoundError(f"pending memory update not found: {update_id}")
+        return _load_model(row, MemoryPendingUpdate)
+
+    def _write_pending_update(self, update: MemoryPendingUpdate) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE memory_pending_updates
+            SET memory_id = ?, status = ?, created_at = ?, payload = ?
+            WHERE update_id = ?
+            """,
+            (
+                update.memory_id,
+                str(update.status),
+                _dt(update.created_at),
+                _dump_model(update),
+                update.update_id,
+            ),
+        )
+        self._connection.commit()
+        if cursor.rowcount == 0:
+            raise MemoryPendingUpdateNotFoundError(f"pending memory update not found: {update.update_id}")
+
+
+class SQLiteMemoryVectorStore(SQLiteRepositoryBase):
+    """SQLite-backed vector index for memory embeddings.
+
+    v1 stores vectors as JSON payloads and computes similarity in Python. This
+    keeps local setup simple while preserving a clear replacement boundary for
+    pgvector, Qdrant, or another production vector backend.
+    """
+
+    def upsert_embedding(self, record: MemoryVectorRecord) -> MemoryVectorRecord:
+        validated = MemoryVectorRecord.model_validate(record.model_dump(mode="python"))
+        if len(validated.embedding) != validated.dimensions:
+            raise ValueError("embedding dimensions must match embedding length")
+        self._connection.execute(
+            """
+            INSERT INTO memory_embeddings(
+                memory_id, embedding_model, dimensions, content_hash, updated_at, payload
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id, embedding_model) DO UPDATE SET
+                dimensions = excluded.dimensions,
+                content_hash = excluded.content_hash,
+                updated_at = excluded.updated_at,
+                payload = excluded.payload
+            """,
+            (
+                validated.memory_id,
+                validated.embedding_model,
+                validated.dimensions,
+                validated.content_hash,
+                _dt(validated.updated_at),
+                _dump_model(validated),
+            ),
+        )
+        self._connection.commit()
+        return _clone_model(validated)
+
+    def get_embedding(self, memory_id: str, embedding_model: str) -> MemoryVectorRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT payload FROM memory_embeddings
+            WHERE memory_id = ? AND embedding_model = ?
+            """,
+            (memory_id, embedding_model),
+        ).fetchone()
+        return _load_model(row, MemoryVectorRecord) if row is not None else None
+
+    def delete_embedding(self, memory_id: str, embedding_model: str | None = None) -> int:
+        if embedding_model is None:
+            cursor = self._connection.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+        else:
+            cursor = self._connection.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ? AND embedding_model = ?",
+                (memory_id, embedding_model),
+            )
+        self._connection.commit()
+        return int(cursor.rowcount)
 
 
 def _select_runtime_rows(

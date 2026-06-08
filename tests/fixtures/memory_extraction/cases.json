@@ -1,0 +1,186 @@
+{
+  "cases": [
+    {
+      "case_id": "action_owner_deadline_zh",
+      "description": "明确负责人和截止时间的行动项",
+      "transcript_window": [
+        {
+          "transcript_id": "seg_action_001",
+          "speaker": "Bao",
+          "text": "张三负责客户报价确认，下周五截止。",
+          "timestamp_ms": 0,
+          "topic": "action item"
+        }
+      ],
+      "session_context": {
+        "org_id": "org_eval",
+        "subject_user_id": "user_eval",
+        "metadata": {
+          "project": "Project Atlas"
+        }
+      },
+      "expected_min_candidates": 1,
+      "expected_candidates": [
+        {
+          "candidate_type": "action_item",
+          "text_contains": ["客户报价确认"],
+          "owner": "张三",
+          "deadline": "下周五",
+          "source_refs": ["transcript:seg_action_001"]
+        }
+      ],
+      "fixture_model_output": {
+        "candidates": [
+          {
+            "type": "action_item",
+            "text": "张三负责客户报价确认，下周五截止。",
+            "write_policy": "eligible",
+            "privacy_level": "medium",
+            "source_refs": ["transcript:seg_action_001"],
+            "owner": "张三",
+            "deadline": "下周五",
+            "status": "open",
+            "project": "Project Atlas"
+          }
+        ],
+        "extraction_notes": "action item extracted",
+        "safety_flags": []
+      }
+    },
+    {
+      "case_id": "decision_manual_entry_only",
+      "description": "明确会议决策",
+      "transcript_window": [
+        {
+          "transcript_id": "seg_decision_001",
+          "speaker": "Bao",
+          "text": "刚才定了，MVP 版本先不做自动推送，只保留手动查看入口。",
+          "timestamp_ms": 0,
+          "topic": "decision"
+        }
+      ],
+      "expected_min_candidates": 1,
+      "expected_candidates": [
+        {
+          "candidate_type": "decision",
+          "text_contains": ["MVP", "手动查看"],
+          "status": "decided",
+          "source_refs": ["transcript:seg_decision_001"]
+        }
+      ],
+      "fixture_model_output": {
+        "candidates": [
+          {
+            "type": "decision",
+            "text": "MVP 版本先不做自动推送，只保留手动查看入口。",
+            "confidence": 0.84,
+            "write_policy": "eligible",
+            "privacy_level": "low",
+            "source_refs": ["transcript:seg_decision_001"],
+            "status": "decided",
+            "topic": "MVP 范围"
+          }
+        ],
+        "extraction_notes": "decision extracted",
+        "safety_flags": []
+      }
+    },
+    {
+      "case_id": "person_role_fact",
+      "description": "人名和角色事实",
+      "transcript_window": [
+        {
+          "transcript_id": "seg_fact_001",
+          "speaker": "Mia",
+          "text": "李四是法务接口，她会确认合同隐私条款是否影响报价方案。",
+          "timestamp_ms": 0,
+          "topic": "person fact"
+        }
+      ],
+      "expected_min_candidates": 1,
+      "expected_candidates": [
+        {
+          "candidate_type": "person_or_fact",
+          "text_contains": ["李四", "法务接口"],
+          "entity_contains": ["李四"],
+          "source_refs": ["transcript:seg_fact_001"]
+        }
+      ],
+      "fixture_model_output": {
+        "candidates": [
+          {
+            "type": "person_or_fact",
+            "text": "李四是法务接口。",
+            "write_policy": "eligible",
+            "privacy_level": "low",
+            "source_refs": ["transcript:seg_fact_001"],
+            "person": "李四",
+            "role": "法务接口"
+          }
+        ],
+        "extraction_notes": "person fact extracted",
+        "safety_flags": []
+      }
+    },
+    {
+      "case_id": "privacy_sensitive_pricing",
+      "description": "敏感报价细节需要确认而非直接 eligible",
+      "transcript_window": [
+        {
+          "transcript_id": "seg_privacy_001",
+          "speaker": "Bao",
+          "text": "客户 ACME 的报价底线是 180 万，这个不要在眼镜端弹出来。",
+          "timestamp_ms": 0,
+          "topic": "privacy"
+        }
+      ],
+      "privacy_constraints": ["不要在眼镜端直接暴露客户敏感报价细节"],
+      "expected_min_candidates": 1,
+      "expected_candidates": [
+        {
+          "candidate_type": "privacy_preference",
+          "text_contains": ["眼镜端", "报价"],
+          "write_policy": "eligible",
+          "source_refs": ["transcript:seg_privacy_001"]
+        }
+      ],
+      "forbidden_text_contains": ["180 万"],
+      "fixture_model_output": {
+        "candidates": [
+          {
+            "type": "privacy_preference",
+            "text": "用户不希望在眼镜端显示客户报价细节。",
+            "confidence": 0.9,
+            "write_policy": "eligible",
+            "privacy_level": "high",
+            "privacy_risk": 0.82,
+            "source_refs": ["transcript:seg_privacy_001"],
+            "topic": "客户报价隐私"
+          }
+        ],
+        "extraction_notes": "privacy preference extracted without raw price",
+        "safety_flags": ["sensitive_pricing_redacted"]
+      }
+    },
+    {
+      "case_id": "smalltalk_no_memory",
+      "description": "闲聊不应抽取长期记忆",
+      "transcript_window": [
+        {
+          "transcript_id": "seg_smalltalk_001",
+          "speaker": "Bao",
+          "text": "今天咖啡不错，我们等人到齐再开始。",
+          "timestamp_ms": 0,
+          "topic": "smalltalk"
+        }
+      ],
+      "expected_min_candidates": 0,
+      "expected_candidates": [],
+      "fixture_model_output": {
+        "candidates": [],
+        "extraction_notes": "no durable memory",
+        "safety_flags": []
+      }
+    }
+  ]
+}

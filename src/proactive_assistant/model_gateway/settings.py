@@ -26,6 +26,14 @@ class ModelGatewaySettings(BaseSettings):
         default="gpt-5-mini",
         validation_alias=AliasChoices("OPENAI_FAST_MODEL", "PROACTIVE_OPENAI_FAST_MODEL"),
     )
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        validation_alias=AliasChoices(
+            "OPENAI_EMBEDDING_MODEL",
+            "PROACTIVE_OPENAI_EMBEDDING_MODEL",
+            "EMBEDDING_MODEL",
+        ),
+    )
     max_output_tokens: int = Field(
         default=1200,
         ge=1,

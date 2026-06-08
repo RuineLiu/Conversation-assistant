@@ -2,6 +2,7 @@
 
 from proactive_assistant.persistence.sqlite import (
     SQLiteMemoryStore,
+    SQLiteMemoryVectorStore,
     SQLiteRuntimeStore,
     SQLiteSessionStore,
     initialize_sqlite_schema,
@@ -9,6 +10,7 @@ from proactive_assistant.persistence.sqlite import (
 
 __all__ = [
     "SQLiteMemoryStore",
+    "SQLiteMemoryVectorStore",
     "SQLiteRuntimeStore",
     "SQLiteSessionStore",
     "initialize_sqlite_schema",

@@ -257,7 +257,8 @@ def _parse_chat_completion_json(response: Any) -> dict[str, Any]:
     choices = getattr(response, "choices", None) or []
     if not choices:
         raise ModelOutputValidationError("chat completion response did not contain choices")
-    message = getattr(choices[0], "message", None)
+    choice = choices[0]
+    message = getattr(choice, "message", None)
     if message is None:
         raise ModelOutputValidationError("chat completion response did not contain a message")
 
@@ -265,10 +266,42 @@ def _parse_chat_completion_json(response: Any) -> dict[str, Any]:
     if isinstance(parsed, dict):
         return parsed
 
-    content = _message_content_text(getattr(message, "content", None))
+    content = _message_text(message)
     if not content.strip():
-        raise ModelOutputValidationError("chat completion message did not contain content")
+        raise ModelOutputValidationError(
+            "chat completion message did not contain content"
+            f" ({_empty_chat_message_detail(choice, message)})"
+        )
     return _loads_json_object_maybe_embedded(content)
+
+
+def _message_text(message: Any) -> str:
+    values = [
+        getattr(message, "content", None),
+        getattr(message, "text", None),
+        getattr(message, "output_text", None),
+        getattr(message, "reasoning_content", None),
+    ]
+    if isinstance(message, dict):
+        values.extend(
+            [
+                message.get("content"),
+                message.get("text"),
+                message.get("output_text"),
+                message.get("reasoning_content"),
+            ]
+        )
+    model_extra = getattr(message, "model_extra", None)
+    if isinstance(model_extra, dict):
+        values.extend(
+            [
+                model_extra.get("content"),
+                model_extra.get("text"),
+                model_extra.get("output_text"),
+                model_extra.get("reasoning_content"),
+            ]
+        )
+    return "".join(_message_content_text(value) for value in values if value is not None)
 
 
 def _message_content_text(content: Any) -> str:
@@ -287,6 +320,27 @@ def _message_content_text(content: Any) -> str:
                 parts.append(text)
         return "".join(parts)
     return ""
+
+
+def _empty_chat_message_detail(choice: Any, message: Any) -> str:
+    finish_reason = getattr(choice, "finish_reason", None)
+    if isinstance(choice, dict):
+        finish_reason = choice.get("finish_reason", finish_reason)
+    fields = sorted(_message_field_names(message))
+    field_text = ",".join(fields) if fields else "none"
+    return f"finish_reason={finish_reason or 'unknown'}, message_fields={field_text}"
+
+
+def _message_field_names(message: Any) -> set[str]:
+    fields: set[str] = set()
+    if isinstance(message, dict):
+        fields.update(str(key) for key in message)
+    else:
+        fields.update(str(key) for key in vars(message).keys())
+    model_extra = getattr(message, "model_extra", None)
+    if isinstance(model_extra, dict):
+        fields.update(str(key) for key in model_extra)
+    return fields
 
 
 def _chat_response_format(request: ModelRequest, mode: str) -> dict[str, Any] | None:

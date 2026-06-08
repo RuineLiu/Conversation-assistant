@@ -135,3 +135,45 @@ def test_openai_chat_completions_client_can_parse_fenced_json_object() -> None:
     response = client.generate_structured(make_request())
 
     assert response.parsed == {"ok": True}
+
+
+def test_openai_chat_completions_client_can_parse_compatible_reasoning_content() -> None:
+    class Completions:
+        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+            return SimpleNamespace(
+                id="chatcmpl_123",
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content="", reasoning_content='{"ok": true}'),
+                    )
+                ],
+                usage=None,
+            )
+
+    client = OpenAIChatCompletionsClient(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+        response_format="json_object",
+    )
+
+    response = client.generate_structured(make_request())
+
+    assert response.parsed == {"ok": True}
+
+
+def test_openai_chat_completions_client_reports_empty_message_details() -> None:
+    class Completions:
+        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+            return SimpleNamespace(
+                id="chatcmpl_123",
+                choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=""))],
+                usage=None,
+            )
+
+    client = OpenAIChatCompletionsClient(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+        response_format="json_schema",
+    )
+
+    with pytest.raises(ModelOutputValidationError, match="finish_reason=stop"):
+        client.generate_structured(make_request())

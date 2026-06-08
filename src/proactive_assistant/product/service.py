@@ -5,12 +5,22 @@ from proactive_assistant.meeting_state import MeetingState, MeetingStateTracker
 from proactive_assistant.memory import (
     InMemoryMemoryStore,
     MemoryContext,
+    MemoryExtractionRequest,
+    MemoryExtractionService,
+    MemoryForgetResult,
+    MemoryPendingUpdate,
+    MemoryPendingUpdateStatus,
+    MemoryPromotionResult,
     MemoryQuery,
     MemoryRecord,
+    MemoryScope,
     MemoryService,
+    MemoryType,
+    MemoryUpsertResult,
     memory_candidates_from_meeting_state,
 )
 from proactive_assistant.orchestration import PromptOrchestrationResult, PromptOrchestrator
+from proactive_assistant.prompting import TranscriptWindowItem
 from proactive_assistant.runtime import (
     FeedbackPolarity,
     FeedbackSignalSource,
@@ -25,6 +35,7 @@ from proactive_assistant.sessions import AssistantSession, SessionConfig, Sessio
 
 from proactive_assistant.product.contracts import (
     ProductFeedbackResult,
+    ProductMemoryExtractionResult,
     ProductMemorySnapshotResult,
     ProductPromptPayload,
     ProductTranscriptStepResult,
@@ -42,12 +53,14 @@ class ProductAssistantService:
         runtime_service: PromptRuntimeService,
         meeting_state_tracker: MeetingStateTracker | None = None,
         memory_service: MemoryService | None = None,
+        memory_extraction_service: MemoryExtractionService | None = None,
     ) -> None:
         self.sessions = session_service
         self.prompt_orchestrator = prompt_orchestrator
         self.runtime = runtime_service
         self.meeting_state_tracker = meeting_state_tracker or MeetingStateTracker()
         self.memory = memory_service or MemoryService(InMemoryMemoryStore())
+        self.memory_extraction = memory_extraction_service
         self._meeting_states: dict[str, MeetingState] = {}
 
     def create_session(
@@ -92,19 +105,19 @@ class ProductAssistantService:
             if use_memory
             else None
         )
-        resolved_memory_context = _merge_unique(
+        base_memory_context = _merge_unique(
             memory_context or [],
             retrieved_memory_context.memory_context if retrieved_memory_context is not None else [],
         )
-        resolved_memory_refs = _merge_unique(
+        base_memory_refs = _merge_unique(
             memory_refs or [],
             retrieved_memory_context.memory_refs if retrieved_memory_context is not None else [],
         )
         snapshot = self.sessions.get_context_snapshot(
             session_id,
             max_segments=max_segments,
-            memory_context=resolved_memory_context,
-            memory_refs=resolved_memory_refs,
+            memory_context=base_memory_context,
+            memory_refs=base_memory_refs,
         )
         state_opportunities = opportunities_from_meeting_gaps(
             session_id,
@@ -112,8 +125,28 @@ class ProductAssistantService:
             fallback_segment_id=transcript_segment.segment_id,
             privacy_constraints=snapshot.privacy_constraints,
         )
-        orchestration_result = self.prompt_orchestrator.run(snapshot, extra_opportunities=state_opportunities)
-        decisions = self.runtime.log_orchestration_result(orchestration_result, policy_version=policy_version)
+        opportunities = self.prompt_orchestrator.select_opportunities(
+            snapshot,
+            extra_opportunities=state_opportunities,
+        )
+        orchestration_result = self._run_memory_aware_orchestration(
+            session_id,
+            base_snapshot=snapshot,
+            base_memory_context=base_memory_context,
+            base_memory_refs=base_memory_refs,
+            opportunities=opportunities,
+            use_memory=use_memory,
+            memory_limit=memory_limit,
+            include_pending_memory=include_pending_memory,
+        )
+        decisions = [
+            self.runtime.log_candidate(
+                candidate,
+                policy_version=policy_version,
+                metadata=_decision_memory_metadata(candidate),
+            )
+            for candidate in orchestration_result.candidates
+        ]
         return ProductTranscriptStepResult(
             session=self.sessions.get_session(session_id),
             transcript_segment=transcript_segment,
@@ -145,6 +178,77 @@ class ProductAssistantService:
         result = self.prompt_orchestrator.run(snapshot)
         self.runtime.log_orchestration_result(result, policy_version=policy_version)
         return result
+
+    def _run_memory_aware_orchestration(
+        self,
+        session_id: str,
+        *,
+        base_snapshot: Any,
+        base_memory_context: list[str],
+        base_memory_refs: list[str],
+        opportunities: list[Any],
+        use_memory: bool,
+        memory_limit: int,
+        include_pending_memory: bool,
+    ) -> PromptOrchestrationResult:
+        candidates = []
+        snapshot_for_result = base_snapshot
+        max_segments = max(len(base_snapshot.recent_transcript.segments), 1)
+        for opportunity in opportunities:
+            opportunity_memory = (
+                self.search_memory_context_for_session(
+                    session_id,
+                    query_text=opportunity.captured_text,
+                    limit=memory_limit,
+                    include_pending=include_pending_memory,
+                    prompt_category=str(_enum_value(opportunity.prompt_category)),
+                    activity_phase=str(_enum_value(opportunity.activity_phase)),
+                    prd_surface=_prd_surface_for_opportunity(opportunity),
+                )
+                if use_memory
+                else None
+            )
+            memory_context = _merge_unique(
+                base_memory_context,
+                opportunity_memory.memory_context if opportunity_memory is not None else [],
+            )
+            memory_refs = _merge_unique(
+                base_memory_refs,
+                opportunity_memory.memory_refs if opportunity_memory is not None else [],
+            )
+            snapshot = self.sessions.get_context_snapshot(
+                session_id,
+                max_segments=max_segments,
+                memory_context=memory_context,
+                memory_refs=memory_refs,
+            )
+            snapshot_for_result = snapshot
+            candidate = self.prompt_orchestrator.generate_candidate(snapshot, opportunity)
+            candidate = candidate.model_copy(
+                update={
+                    "metadata": {
+                        **candidate.metadata,
+                        "memory_context": list(memory_context),
+                        "memory_refs": list(memory_refs),
+                        "retrieved_memory_refs": list(opportunity_memory.memory_refs)
+                        if opportunity_memory is not None
+                        else [],
+                        "retrieved_memory_result_count": len(opportunity_memory.results)
+                        if opportunity_memory is not None
+                        else 0,
+                        "memory_query_text": opportunity.captured_text,
+                        "memory_query_prompt_category": str(_enum_value(opportunity.prompt_category)),
+                        "memory_query_activity_phase": str(_enum_value(opportunity.activity_phase)),
+                    }
+                }
+            )
+            candidates.append(candidate)
+        return PromptOrchestrationResult(
+            session_id=session_id,
+            snapshot=snapshot_for_result,
+            opportunities=opportunities,
+            candidates=candidates,
+        )
 
     def get_meeting_state(self, session_id: str) -> MeetingState:
         return self._get_or_create_meeting_state(session_id)
@@ -264,6 +368,40 @@ class ProductAssistantService:
     def archive_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord:
         return self.memory.archive_memory(memory_id, reason=reason)
 
+    def forget_memory(self, memory_id: str, *, reason: str = "") -> MemoryForgetResult:
+        return self.memory.forget_memory(memory_id, reason=reason)
+
+    def list_pending_memory_updates(
+        self,
+        *,
+        memory_id: str | None = None,
+        status: MemoryPendingUpdateStatus | str | None = MemoryPendingUpdateStatus.PENDING,
+    ) -> list[MemoryPendingUpdate]:
+        return self.memory.list_pending_updates(memory_id=memory_id, status=status)
+
+    def apply_pending_memory_update(self, update_id: str, *, reason: str = "") -> MemoryUpsertResult:
+        return self.memory.apply_pending_update(update_id, reason=reason)
+
+    def reject_pending_memory_update(self, update_id: str, *, reason: str = "") -> MemoryPendingUpdate:
+        return self.memory.reject_pending_update(update_id, reason=reason)
+
+    def promote_memory(
+        self,
+        memory_id: str,
+        *,
+        target_scope: MemoryScope | str | None = None,
+        target_memory_type: MemoryType | str | None = None,
+        reason: str = "",
+        approved: bool = False,
+    ) -> MemoryPromotionResult:
+        return self.memory.promote_memory(
+            memory_id,
+            target_scope=target_scope,
+            target_memory_type=target_memory_type,
+            reason=reason,
+            approved=approved,
+        )
+
     def write_meeting_state_memory_snapshot(
         self,
         session_id: str,
@@ -276,20 +414,92 @@ class ProductAssistantService:
         current_ms = max((utterance.end_ms for utterance in state.utterances), default=None)
         gaps = self.meeting_state_tracker.scan_state_gaps(state, current_ms=current_ms) if include_gaps else []
         candidates = memory_candidates_from_meeting_state(state, gaps=gaps)
-        memories = (
+        upserts = (
             [
-                self.memory.commit_candidate_once(candidate, org_id=state.org_id, user_id=state.subject_user_id)
+                self.memory.upsert_candidate(candidate, org_id=state.org_id, user_id=state.subject_user_id)
                 for candidate in candidates
             ]
             if commit
             else []
         )
+        memories = [result.memory for result in upserts]
         return ProductMemorySnapshotResult(
             session=session,
             meeting_state=state,
             memory_candidates=candidates,
             memories=memories,
+            memory_upserts=upserts,
             committed=commit,
+        )
+
+    def extract_session_memories(
+        self,
+        session_id: str,
+        *,
+        commit: bool = True,
+        max_segments: int = 24,
+        max_candidates: int = 8,
+        include_meeting_state: bool = True,
+        memory_context: list[str] | None = None,
+        model: str | None = None,
+    ) -> ProductMemoryExtractionResult:
+        if self.memory_extraction is None:
+            raise ValueError("memory extraction service is not configured")
+        session = self.sessions.get_session(session_id)
+        snapshot = self.sessions.get_context_snapshot(
+            session_id,
+            max_segments=max_segments,
+            memory_context=memory_context,
+        )
+        if not snapshot.recent_transcript.segments:
+            raise ValueError("cannot extract memory without transcript segments")
+
+        org_id, user_id = _memory_identity(session)
+        state = self._get_or_create_meeting_state(session_id)
+        extraction = self.memory_extraction.extract_candidates(
+            MemoryExtractionRequest(
+                session_id=session_id,
+                scenario_id=str(session.scene),
+                locale=session.locale,
+                transcript_window=[
+                    TranscriptWindowItem(
+                        transcript_id=segment.segment_id,
+                        speaker=segment.speaker,
+                        text=segment.text,
+                        timestamp_ms=segment.start_ms,
+                        topic=segment.topic,
+                    )
+                    for segment in snapshot.recent_transcript.segments
+                ],
+                session_context={
+                    "status": session.status,
+                    "pre_context": session.pre_context,
+                    "metadata": session.metadata,
+                    "org_id": org_id,
+                    "subject_user_id": user_id,
+                    "transcript_stats": snapshot.transcript_stats,
+                },
+                meeting_state=state.model_dump(mode="json") if include_meeting_state else {},
+                memory_context=snapshot.memory_context,
+                privacy_constraints=session.privacy_constraints,
+                max_candidates=max_candidates,
+            ),
+            model=model,
+        )
+        upserts = (
+            [self.memory.upsert_candidate(candidate, org_id=org_id, user_id=user_id) for candidate in extraction.candidates]
+            if commit
+            else []
+        )
+        return ProductMemoryExtractionResult(
+            session=session,
+            memory_candidates=extraction.candidates,
+            memories=[result.memory for result in upserts],
+            memory_upserts=upserts,
+            committed=commit,
+            extraction_notes=extraction.extraction_notes,
+            safety_flags=extraction.safety_flags,
+            model_usage=extraction.model_usage,
         )
 
     def _persist_memory_candidates_for_event(self, decision_id: str, event_id: str) -> list[MemoryCandidate]:
@@ -359,6 +569,28 @@ def _safety_flags(decision: PromptDecisionRecord) -> list[str]:
     if decision.candidate.prompt_result is not None:
         flags.extend(decision.candidate.prompt_result.safety_flags)
     return sorted(set(flags))
+
+
+def _decision_memory_metadata(candidate: Any) -> dict[str, Any]:
+    return {
+        "memory_context": list(candidate.metadata.get("memory_context", candidate.prompt_request.memory_context)),
+        "memory_refs": list(candidate.metadata.get("memory_refs", candidate.prompt_request.session_context.get("memory_refs", []))),
+        "retrieved_memory_refs": list(candidate.metadata.get("retrieved_memory_refs", [])),
+        "retrieved_memory_result_count": int(candidate.metadata.get("retrieved_memory_result_count", 0)),
+        "memory_query_text": str(candidate.metadata.get("memory_query_text", "")),
+        "memory_query_prompt_category": str(candidate.metadata.get("memory_query_prompt_category", "")),
+        "memory_query_activity_phase": str(candidate.metadata.get("memory_query_activity_phase", "")),
+    }
+
+
+def _prd_surface_for_opportunity(opportunity: Any) -> str:
+    if str(_enum_value(opportunity.candidate_timing_action)) == "after_activity":
+        return "app_summary_tab"
+    if str(_enum_value(opportunity.privacy_level)) == "high" or opportunity.privacy_risk >= 0.7:
+        return "app_prompt_tab"
+    if str(_enum_value(opportunity.priority)) == "P2":
+        return "app_prompt_tab"
+    return "glasses_popup"
 
 
 def _optional_int(value: object) -> int | None:
@@ -444,3 +676,7 @@ def _clean_active_entity(entity: dict[str, Any]) -> dict[str, Any]:
         **entity,
         "aliases": [str(alias) for alias in aliases if alias],
     }
+
+
+def _enum_value(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value

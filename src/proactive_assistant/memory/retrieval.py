@@ -17,6 +17,14 @@ from proactive_assistant.memory.contracts import (
     MemoryUsePolicy,
 )
 from proactive_assistant.memory.store import MemoryRepository
+from proactive_assistant.memory.vector_store import (
+    MemoryVectorRecord,
+    MemoryVectorStore,
+    cosine_similarity,
+    memory_embedding_content_hash,
+    memory_embedding_text,
+)
+from proactive_assistant.model_gateway.embeddings import EmbeddingClient
 from proactive_assistant.prompting import PRDSurface, PrivacyLevel, PromptCategory
 
 
@@ -66,19 +74,30 @@ class StructuredMemoryQuery:
 
 
 class MemoryRetriever:
-    """Deterministic v1 memory retrieval and ranking engine.
+    """Memory retrieval and ranking engine.
 
-    The implementation intentionally avoids embeddings and LLM rerank. Exact
-    lookup intents take a conservative filtered path, while open recall uses a
-    normalized, explainable ranker.
+    Exact lookup intents take a conservative filtered path. Open recall uses
+    explainable lexical/type/scope features and can optionally blend semantic
+    similarity from a pluggable embedding client plus vector store.
     """
 
-    def __init__(self, store: MemoryRepository) -> None:
+    def __init__(
+        self,
+        store: MemoryRepository,
+        *,
+        embedding_client: EmbeddingClient | None = None,
+        vector_store: MemoryVectorStore | None = None,
+        embedding_model: str | None = None,
+    ) -> None:
         self.store = store
+        self._embedding_client = embedding_client
+        self._vector_store = vector_store
+        self._embedding_model = embedding_model
 
     def retrieve(self, query: MemoryQuery) -> MemoryContext:
         structured = build_structured_query(query)
         candidates = self._candidate_pool(query, structured)
+        semantic_scores = self._semantic_scores(query, candidates)
         if structured.intent in {
             MemoryRetrievalIntent.LOOKUP_DEADLINE,
             MemoryRetrievalIntent.LOOKUP_OWNER,
@@ -86,7 +105,7 @@ class MemoryRetriever:
         }:
             results = self._exact_lookup(candidates, query, structured)
         else:
-            results = self._open_recall(candidates, query, structured)
+            results = self._open_recall(candidates, query, structured, semantic_scores)
         return MemoryContext(
             memory_context=[_context_line(result) for result in results],
             memory_refs=[f"memory:{result.memory.memory_id}" for result in results],
@@ -153,12 +172,23 @@ class MemoryRetriever:
         candidates: list[MemoryRecord],
         query: MemoryQuery,
         structured: StructuredMemoryQuery,
+        semantic_scores: dict[str, float],
     ) -> list[MemorySearchResult]:
         scored: list[MemorySearchResult] = []
         for memory in candidates:
-            score, features = _open_recall_score(memory, query, structured)
+            score, features = _open_recall_score(
+                memory,
+                query,
+                structured,
+                semantic_score=semantic_scores.get(memory.memory_id, 0.0),
+            )
             matched_terms = _matched_terms(memory, structured)
-            if structured.keywords and not matched_terms and features["source_ref"] == 0.0:
+            if (
+                structured.keywords
+                and not matched_terms
+                and features["source_ref"] == 0.0
+                and features.get("semantic", 0.0) < query.semantic_min_score
+            ):
                 continue
             scored.append(
                 MemorySearchResult(
@@ -184,6 +214,52 @@ class MemoryRetriever:
             ),
         )
         return _diversify(ranked, query.limit)
+
+    def _semantic_scores(self, query: MemoryQuery, candidates: list[MemoryRecord]) -> dict[str, float]:
+        if (
+            not query.use_semantic_retrieval
+            or self._embedding_client is None
+            or self._vector_store is None
+            or not self._embedding_model
+            or not candidates
+        ):
+            return {}
+
+        query_text = _semantic_query_text(query)
+        if not query_text:
+            return {}
+
+        query_embedding = self._embedding_client.embed_texts([query_text], model=self._embedding_model).embeddings[0]
+        memory_embeddings: dict[str, list[float]] = {}
+        missing_texts: list[str] = []
+        missing_memories: list[tuple[MemoryRecord, str]] = []
+        for memory in candidates:
+            content_hash = memory_embedding_content_hash(memory)
+            stored = self._vector_store.get_embedding(memory.memory_id, self._embedding_model)
+            if stored is not None and stored.content_hash == content_hash:
+                memory_embeddings[memory.memory_id] = stored.embedding
+                continue
+            missing_texts.append(memory_embedding_text(memory))
+            missing_memories.append((memory, content_hash))
+
+        if missing_texts:
+            response = self._embedding_client.embed_texts(missing_texts, model=self._embedding_model)
+            for (memory, content_hash), embedding in zip(missing_memories, response.embeddings, strict=True):
+                record = MemoryVectorRecord(
+                    memory_id=memory.memory_id,
+                    embedding_model=self._embedding_model,
+                    dimensions=len(embedding),
+                    embedding=embedding,
+                    content_hash=content_hash,
+                    updated_at=datetime.now(UTC),
+                )
+                self._vector_store.upsert_embedding(record)
+                memory_embeddings[memory.memory_id] = embedding
+
+        return {
+            memory_id: round(cosine_similarity(query_embedding, embedding), 4)
+            for memory_id, embedding in memory_embeddings.items()
+        }
 
 
 def build_structured_query(query: MemoryQuery) -> StructuredMemoryQuery:
@@ -303,6 +379,8 @@ def _open_recall_score(
     memory: MemoryRecord,
     query: MemoryQuery,
     structured: StructuredMemoryQuery,
+    *,
+    semantic_score: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     lexical = _lexical_score(memory, structured)
     type_fit = _type_fit(memory, structured)
@@ -321,17 +399,31 @@ def _open_recall_score(
         "feedback": feedback,
         "source_ref": source_ref,
         "redundancy": redundancy,
+        "semantic": semantic_score if query.use_semantic_retrieval else 0.0,
     }
-    weights = {
-        "lexical": 0.25,
-        "type_fit": 0.15,
-        "scope_fit": 0.15,
-        "recency": 0.12,
-        "importance": 0.11,
-        "confidence": 0.10,
-        "feedback": 0.07,
-        "source_ref": 0.05,
-    }
+    if query.use_semantic_retrieval:
+        weights = {
+            "semantic": 0.30,
+            "lexical": 0.17,
+            "type_fit": 0.13,
+            "scope_fit": 0.12,
+            "recency": 0.10,
+            "importance": 0.08,
+            "confidence": 0.06,
+            "feedback": 0.03,
+            "source_ref": 0.01,
+        }
+    else:
+        weights = {
+            "lexical": 0.25,
+            "type_fit": 0.15,
+            "scope_fit": 0.15,
+            "recency": 0.12,
+            "importance": 0.11,
+            "confidence": 0.10,
+            "feedback": 0.07,
+            "source_ref": 0.05,
+        }
     score = sum(weights[key] * features[key] for key in weights) - 0.12 * redundancy
     return round(_clamp(score), 4), {key: round(value, 4) for key, value in features.items()}
 
@@ -465,9 +557,25 @@ def _provenance(memory: MemoryRecord) -> list[str]:
 def _reason_for_open_recall(query: MemoryQuery, matched_terms: list[str]) -> str:
     if not query.query_text:
         return "ranked by importance and confidence"
+    if query.use_semantic_retrieval and not matched_terms:
+        return "open_recall: semantic hybrid ranking"
+    if query.use_semantic_retrieval:
+        return "open_recall: semantic/keyword hybrid ranking"
     if matched_terms:
         return "open_recall: keyword/type/scope/recency ranking"
     return "open_recall: source or context fit"
+
+
+def _semantic_query_text(query: MemoryQuery) -> str:
+    parts = [
+        query.query_text,
+        query.recent_transcript_text,
+        " ".join(str(entity.get("canonical_name") or entity.get("name") or "") for entity in query.active_entities),
+        " ".join(query.current_gap_types),
+        str(query.prompt_category or ""),
+        query.activity_phase,
+    ]
+    return " ".join(part for part in parts if part).strip()
 
 
 def _diversify(results: list[MemorySearchResult], limit: int) -> list[MemorySearchResult]:

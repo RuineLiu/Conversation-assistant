@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from proactive_assistant.memory.contracts import (
+    MemoryPendingUpdate,
+    MemoryPendingUpdateStatus,
     MemoryQuery,
     MemoryRecord,
     MemoryRecordUpdate,
@@ -27,6 +29,14 @@ class MemoryNotFoundError(MemoryStoreError):
     """Raised when a memory id does not exist."""
 
 
+class MemoryPendingUpdateAlreadyExistsError(MemoryStoreError):
+    """Raised when inserting a duplicate pending memory update id."""
+
+
+class MemoryPendingUpdateNotFoundError(MemoryStoreError):
+    """Raised when a pending memory update id does not exist."""
+
+
 @runtime_checkable
 class MemoryRepository(Protocol):
     """Repository contract for long-term memory records and deterministic retrieval."""
@@ -43,6 +53,27 @@ class MemoryRepository(Protocol):
 
     def archive_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord: ...
 
+    def forget_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord: ...
+
+    def add_pending_update(self, update: MemoryPendingUpdate) -> MemoryPendingUpdate: ...
+
+    def get_pending_update(self, update_id: str) -> MemoryPendingUpdate: ...
+
+    def list_pending_updates(
+        self,
+        *,
+        memory_id: str | None = None,
+        status: MemoryPendingUpdateStatus | str | None = None,
+    ) -> list[MemoryPendingUpdate]: ...
+
+    def update_pending_update_status(
+        self,
+        update_id: str,
+        status: MemoryPendingUpdateStatus | str,
+        *,
+        reason: str = "",
+    ) -> MemoryPendingUpdate: ...
+
 
 MemoryStore = MemoryRepository
 
@@ -53,6 +84,8 @@ class InMemoryMemoryStore:
     def __init__(self) -> None:
         self._memories: dict[str, MemoryRecord] = {}
         self._order: list[str] = []
+        self._pending_updates: dict[str, MemoryPendingUpdate] = {}
+        self._pending_order: list[str] = []
 
     def add_memory(self, memory: MemoryRecord) -> MemoryRecord:
         if memory.memory_id in self._memories:
@@ -123,14 +156,74 @@ class InMemoryMemoryStore:
             MemoryRecordUpdate(write_status=MemoryWriteStatus.ARCHIVED, metadata=metadata),
         )
 
+    def forget_memory(self, memory_id: str, *, reason: str = "") -> MemoryRecord:
+        memory = self._get(memory_id)
+        return self.update_memory(memory_id, _forgotten_memory_update(memory, reason=reason))
+
+    def add_pending_update(self, update: MemoryPendingUpdate) -> MemoryPendingUpdate:
+        if update.update_id in self._pending_updates:
+            raise MemoryPendingUpdateAlreadyExistsError(f"pending memory update already exists: {update.update_id}")
+        self._get(update.memory_id)
+        self._pending_updates[update.update_id] = deepcopy(update)
+        self._pending_order.append(update.update_id)
+        return deepcopy(update)
+
+    def get_pending_update(self, update_id: str) -> MemoryPendingUpdate:
+        update = self._get_pending_update(update_id)
+        return deepcopy(update)
+
+    def list_pending_updates(
+        self,
+        *,
+        memory_id: str | None = None,
+        status: MemoryPendingUpdateStatus | str | None = None,
+    ) -> list[MemoryPendingUpdate]:
+        resolved_status = MemoryPendingUpdateStatus(status).value if status is not None else None
+        updates = [self._pending_updates[update_id] for update_id in self._pending_order]
+        filtered = [
+            update
+            for update in updates
+            if (memory_id is None or update.memory_id == memory_id)
+            and (resolved_status is None or update.status == resolved_status)
+        ]
+        return [deepcopy(update) for update in filtered]
+
+    def update_pending_update_status(
+        self,
+        update_id: str,
+        status: MemoryPendingUpdateStatus | str,
+        *,
+        reason: str = "",
+    ) -> MemoryPendingUpdate:
+        update = self._get_pending_update(update_id)
+        resolved_status = MemoryPendingUpdateStatus(status)
+        updated = update.model_copy(
+            update={
+                "status": resolved_status,
+                "resolved_at": datetime.now(UTC) if resolved_status != MemoryPendingUpdateStatus.PENDING else None,
+                "resolved_reason": reason,
+            }
+        )
+        updated = MemoryPendingUpdate.model_validate(updated.model_dump(mode="python"))
+        self._pending_updates[update_id] = updated
+        return deepcopy(updated)
+
     def _get(self, memory_id: str) -> MemoryRecord:
         try:
             return self._memories[memory_id]
         except KeyError as exc:
             raise MemoryNotFoundError(f"memory not found: {memory_id}") from exc
 
+    def _get_pending_update(self, update_id: str) -> MemoryPendingUpdate:
+        try:
+            return self._pending_updates[update_id]
+        except KeyError as exc:
+            raise MemoryPendingUpdateNotFoundError(f"pending memory update not found: {update_id}") from exc
+
 
 def _matches_query(memory: MemoryRecord, query: MemoryQuery) -> bool:
+    if not query.include_forgotten and memory.write_status == MemoryWriteStatus.FORGOTTEN.value:
+        return False
     if not query.include_archived and memory.write_status == MemoryWriteStatus.ARCHIVED.value:
         return False
     if not query.include_pending and memory.write_status == MemoryWriteStatus.PENDING_CONFIRMATION.value:
@@ -185,7 +278,28 @@ def _status_rank(memory: MemoryRecord) -> int:
         MemoryWriteStatus.PENDING_CONFIRMATION.value: 1,
         MemoryWriteStatus.ARCHIVED.value: 2,
         MemoryWriteStatus.REJECTED.value: 3,
+        MemoryWriteStatus.FORGOTTEN.value: 4,
     }.get(memory.write_status, 4)
+
+
+def _forgotten_memory_update(memory: MemoryRecord, *, reason: str = "") -> MemoryRecordUpdate:
+    metadata = {
+        "memory_schema_version": "memory_forget_v1",
+        "forgotten": True,
+        "forgotten_at": datetime.now(UTC).isoformat(),
+        "forgotten_previous_write_status": str(memory.write_status),
+    }
+    if reason:
+        metadata["forget_reason"] = reason
+    return MemoryRecordUpdate(
+        text="[forgotten]",
+        source_ids=[],
+        confidence=0.0,
+        importance=0.0,
+        write_status=MemoryWriteStatus.FORGOTTEN,
+        tags=["forgotten"],
+        metadata=metadata,
+    )
 
 
 def _score_memory(memory: MemoryRecord, matched_terms: list[str], query_terms: set[str]) -> float:
