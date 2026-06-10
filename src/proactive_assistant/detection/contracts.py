@@ -48,6 +48,12 @@ class PromptOpportunity(BaseModel):
     reason: str
     safety_flags: list[str] = Field(default_factory=list)
     rule_matches: list[DetectionRuleMatch] = Field(default_factory=list)
+    # Speaker whose utterance triggered this opportunity. Empty string when
+    # the trigger does not map to a single speaker (e.g. structural gap
+    # spanning multiple utterances). The product/runtime layer uses this
+    # for audit ("responding to 张三's mention") and to attach speaker
+    # identity to downstream memory writes.
+    target_speaker_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

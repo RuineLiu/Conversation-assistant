@@ -1,10 +1,20 @@
 """Product-facing flow service for proactive assistant sessions."""
 
 from proactive_assistant.product.contracts import (
+    ProductAudioTranscriptStepResult,
     ProductFeedbackResult,
+    ProductInlineMemoryCaptureResult,
     ProductMemoryExtractionResult,
     ProductMemorySnapshotResult,
+    ProductPolicyBaselineResult,
+    ProductPolicyEvaluationResult,
+    ProductPolicyEpisodeResult,
+    ProductPolicyTrainingExportResult,
+    ProductPrivacyMetrics,
     ProductPromptPayload,
+    ProductSessionLifecycleResult,
+    ProductSessionStateResult,
+    ProductSessionSummaryResult,
     ProductTranscriptStepResult,
 )
 from proactive_assistant.product.api import create_app, create_default_product_service
@@ -12,10 +22,20 @@ from proactive_assistant.product.service import ProductAssistantService, prompt_
 
 __all__ = [
     "ProductAssistantService",
+    "ProductAudioTranscriptStepResult",
     "ProductFeedbackResult",
+    "ProductInlineMemoryCaptureResult",
     "ProductMemoryExtractionResult",
     "ProductMemorySnapshotResult",
+    "ProductPolicyBaselineResult",
+    "ProductPolicyEvaluationResult",
+    "ProductPolicyEpisodeResult",
+    "ProductPolicyTrainingExportResult",
+    "ProductPrivacyMetrics",
     "ProductPromptPayload",
+    "ProductSessionLifecycleResult",
+    "ProductSessionStateResult",
+    "ProductSessionSummaryResult",
     "ProductTranscriptStepResult",
     "create_app",
     "create_default_product_service",

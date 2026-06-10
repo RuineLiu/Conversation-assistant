@@ -29,6 +29,7 @@ from proactive_assistant.memory.contracts import (
 )
 from proactive_assistant.memory.consolidation import consolidated_memory_metadata, consolidated_memory_tags
 from proactive_assistant.memory.merge import detect_memory_merge
+from proactive_assistant.memory.query_understanding import QueryUnderstandingService
 from proactive_assistant.memory.retrieval import MemoryRetriever
 from proactive_assistant.memory.store import MemoryRepository
 from proactive_assistant.memory.store import MemoryAlreadyExistsError, MemoryPendingUpdateAlreadyExistsError
@@ -48,11 +49,13 @@ class MemoryService:
         embedding_client: EmbeddingClient | None = None,
         vector_store: MemoryVectorStore | None = None,
         embedding_model: str | None = None,
+        query_understanding: QueryUnderstandingService | None = None,
     ) -> None:
         self.store = store
         self.embedding_client = embedding_client
         self.vector_store = vector_store
         self.embedding_model = embedding_model
+        self.query_understanding = query_understanding
 
     def propose_from_candidate(
         self,
@@ -532,6 +535,7 @@ class MemoryService:
             embedding_client=self.embedding_client,
             vector_store=self.vector_store,
             embedding_model=self.embedding_model,
+            query_understanding=self.query_understanding,
         ).retrieve(query)
 
     def _merge_candidate_pool(self, proposed: MemoryRecord) -> list[MemoryRecord]:

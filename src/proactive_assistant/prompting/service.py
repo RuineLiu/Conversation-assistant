@@ -55,7 +55,7 @@ class PromptGenerationService:
 
 def _parse_prompt_result(response: ModelResponse) -> PromptGenerationResult:
     try:
-        output = PromptGenerationModelOutput.model_validate(response.parsed)
+        output = PromptGenerationModelOutput.model_validate(_normalize_prompt_payload(response.parsed))
     except ValidationError as exc:
         raise ModelOutputValidationError("model output failed PromptGenerationResult validation") from exc
     usage = ModelUsageMetadata(
@@ -69,3 +69,46 @@ def _parse_prompt_result(response: ModelResponse) -> PromptGenerationResult:
     )
     result = PromptGenerationResult.model_validate(output.model_dump(mode="json"))
     return result.with_usage(usage)
+
+
+def _normalize_prompt_payload(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+
+    allowed_fields = set(PromptGenerationModelOutput.model_fields)
+    normalized = {key: value for key, value in payload.items() if key in allowed_fields}
+
+    should_prompt = bool(normalized.get("should_prompt", False))
+    normalized.setdefault("content_granularity", 2 if should_prompt else 0)
+    normalized.setdefault("confidence", 0.7 if should_prompt else 0.0)
+    normalized.setdefault("privacy_level", "low")
+    normalized.setdefault("privacy_risk", _default_privacy_risk(normalized["privacy_level"]))
+    normalized["source_refs"] = _normalize_source_refs(normalized.get("source_refs", []))
+    normalized.setdefault("rationale", "")
+    normalized.setdefault("safety_flags", [])
+    return normalized
+
+
+def _default_privacy_risk(privacy_level: object) -> float:
+    if privacy_level == "high":
+        return 0.85
+    if privacy_level == "medium":
+        return 0.35
+    return 0.08
+
+
+def _normalize_source_refs(source_refs: object) -> list[str]:
+    if not isinstance(source_refs, list):
+        return []
+
+    refs: list[str] = []
+    for ref in source_refs:
+        if isinstance(ref, str):
+            refs.append(ref)
+            continue
+        if isinstance(ref, dict):
+            ref_type = ref.get("type") or ref.get("source_type") or "source"
+            ref_id = ref.get("id") or ref.get("transcript_id") or ref.get("source_id")
+            if ref_id:
+                refs.append(f"{ref_type}:{ref_id}")
+    return refs

@@ -184,6 +184,51 @@ def test_smoke_openai_prompt_command_prints_json(monkeypatch: pytest.MonkeyPatch
     assert captured["settings"].request_timeout_seconds == 9
 
 
+def test_smoke_openai_prompt_ignores_empty_base_url_arg(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured = {}
+
+    def fake_smoke_runner(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return PromptSmokeTestResult(
+            ok=True,
+            provider="fake",
+            model=kwargs["model"],
+            latency_ms=3,
+            should_prompt=True,
+            prompt_category="summary_gap_check",
+            content_granularity=2,
+            glasses_title="负责人待确认",
+            glasses_text="这个风险还没有明确 owner。",
+            source_refs=["transcript:transcript_smoke_001"],
+            confidence=0.84,
+            privacy_level="low",
+            privacy_risk=0.08,
+        )
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:58081")
+    monkeypatch.setattr("proactive_assistant.cli.run_openai_prompt_smoke_test", fake_smoke_runner)
+
+    exit_code = main(
+        [
+            "smoke-openai-prompt",
+            "--model",
+            "gpt-test",
+            "--base-url",
+            "",
+            "--api-style",
+            "chat_completions",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert captured["settings"].openai_base_url == "http://127.0.0.1:58081"
+
+
 def test_smoke_openai_memory_extraction_command_prints_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

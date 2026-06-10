@@ -50,6 +50,14 @@ class ModelGatewaySettings(BaseSettings):
             "PROACTIVE_OPENAI_REQUEST_TIMEOUT_SECONDS",
         ),
     )
+    glasses_prompt_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PROACTIVE_GLASSES_PROMPT_TIMEOUT_SECONDS",
+            "GLASSES_PROMPT_TIMEOUT_SECONDS",
+        ),
+    )
     store_model_responses: bool = Field(
         default=False,
         validation_alias=AliasChoices(

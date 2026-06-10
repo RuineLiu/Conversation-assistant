@@ -73,6 +73,16 @@ def test_suggestion_rule_detects_next_step_request() -> None:
     assert opportunity.suggested_content_granularity == ContentGranularity.CONCISE_BULLETS
 
 
+def test_concept_rule_detects_unfamiliar_term_explanation_need() -> None:
+    snapshot = make_snapshot("刚才说的 entropy 是什么意思？我没有反应过来。")
+
+    opportunity = PromptOpportunityDetector().detect(snapshot).opportunities[0]
+
+    assert opportunity.prompt_category == PromptCategory.CONCEPT_EXPLANATION
+    assert opportunity.suggested_content_granularity == ContentGranularity.ONE_LINE_ANSWER
+    assert opportunity.rule_matches[0].rule_name == "concept_explanation_rule"
+
+
 def test_high_privacy_downgrades_priority_and_granularity() -> None:
     snapshot = make_snapshot("这个客户报价风险怎么跟老板说？", privacy_constraints=["avoid customer data"])
 
@@ -105,3 +115,80 @@ def test_detector_limits_max_opportunities() -> None:
     result = PromptOpportunityDetector(max_opportunities=2).detect(snapshot)
 
     assert len(result.opportunities) == 2
+
+
+def test_detector_emits_concept_explanation_opportunity_from_llm_detector() -> None:
+    """End-to-end: PromptOpportunityDetector + UnknownTermDetector together
+    should produce a CONCEPT_EXPLANATION opportunity with pre_generated
+    explanation in metadata, ready for the orchestrator's fast path.
+    """
+
+    from proactive_assistant.detection import UnknownTermDetector
+    from proactive_assistant.detection.service import PromptOpportunityDetector
+    from proactive_assistant.model_gateway import FakeModelClient
+    from proactive_assistant.model_gateway.settings import ModelGatewaySettings
+    from proactive_assistant.prompting import PromptCategory
+    from proactive_assistant.sessions import (
+        InMemorySessionStore,
+        SessionConfig,
+        SessionService,
+        TranscriptSegmentInput,
+    )
+
+    response = {
+        "candidates": [
+            {
+                "term": "GMV",
+                "term_type": "acronym",
+                "explanation": "商品交易总额，电商核心指标。",
+                "confidence": 0.86,
+                "privacy_level": "low",
+                "privacy_risk": 0.05,
+                "source_segment_id": "seg_0",
+                "rationale": "电商术语",
+            }
+        ],
+        "detection_notes": "",
+        "safety_flags": [],
+    }
+    unknown_detector = UnknownTermDetector(
+        model_client=FakeModelClient(response),
+        settings=ModelGatewaySettings(default_model="gpt-test", max_output_tokens=512),
+    )
+    detector = PromptOpportunityDetector(
+        max_opportunities=5,
+        unknown_term_detector=unknown_detector,
+        vocabulary_service=None,
+    )
+
+    session_service = SessionService(InMemorySessionStore())
+    session_service.create_session(
+        SessionConfig(title="GMV demo", pre_context="电商业务讨论。"),
+        session_id="session_001",
+    )
+    session_service.append_transcript(
+        "session_001",
+        TranscriptSegmentInput(
+            speaker="Bao",
+            start_ms=0,
+            end_ms=1000,
+            text="我们这季度 GMV 增长了 20%。",
+            asr_confidence=0.92,
+        ),
+        segment_id="seg_0",
+    )
+    snapshot = session_service.get_context_snapshot("session_001")
+
+    result = detector.detect(snapshot)
+
+    concept_opps = [
+        o for o in result.opportunities
+        if str(o.prompt_category) == PromptCategory.CONCEPT_EXPLANATION.value
+    ]
+    assert len(concept_opps) == 1
+    opp = concept_opps[0]
+    assert opp.captured_text == "GMV"
+    assert opp.metadata["pre_generated_explanation"] == "商品交易总额，电商核心指标。"
+    assert opp.metadata["unknown_term"] == "GMV"
+    assert opp.metadata["unknown_term_type"] == "acronym"
+    assert opp.metadata["detection_source"] == "llm_unknown_term_detector"

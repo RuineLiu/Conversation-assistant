@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from proactive_assistant.detection.contracts import CandidateTimingAction, DetectionRuleMatch, PromptPriority
 from proactive_assistant.prompting import ContentGranularity, PrivacyLevel, PromptCategory
@@ -106,6 +107,31 @@ SUGGESTION_TERMS = (
     "how should",
 )
 
+CONCEPT_TERMS = (
+    "是什么意思",
+    "什么意思",
+    "怎么理解",
+    "如何理解",
+    "解释一下",
+    "解释下",
+    "不熟悉",
+    "听不懂",
+    "陌生词",
+    "专业术语",
+    "术语",
+    "概念",
+    "定义",
+    "缩写",
+    "abbreviation",
+    "acronym",
+    "what does",
+    "what is",
+    "means",
+    "meaning",
+    "explain",
+    "definition",
+)
+
 GAP_TERMS = (
     "谁负责",
     "负责人",
@@ -195,6 +221,7 @@ def detect_candidates(segment: TranscriptSegmentRecord) -> list[RuleCandidate]:
     candidates.extend(_gap_candidates(text))
     candidates.extend(_suggestion_candidates(text))
     candidates.extend(_fact_candidates(text))
+    candidates.extend(_concept_candidates(text))
     candidates.extend(_question_candidates(text))
     return candidates
 
@@ -239,8 +266,8 @@ def category_rank(category: PromptCategory) -> int:
         PromptCategory.SUMMARY_GAP_CHECK: 0,
         PromptCategory.SUGGESTION: 1,
         PromptCategory.PERSON_OR_FACT: 2,
-        PromptCategory.QUESTION_ANSWER: 3,
-        PromptCategory.CONCEPT_EXPLANATION: 4,
+        PromptCategory.CONCEPT_EXPLANATION: 3,
+        PromptCategory.QUESTION_ANSWER: 4,
     }
     return ranks[category]
 
@@ -343,6 +370,25 @@ def _fact_candidates(text: str) -> list[RuleCandidate]:
     ]
 
 
+def _concept_candidates(text: str) -> list[RuleCandidate]:
+    terms = _matched_terms(text, CONCEPT_TERMS)
+    if not terms and not _looks_like_term_explanation_need(text):
+        return []
+    return [
+        RuleCandidate(
+            rule_name="concept_explanation_rule",
+            prompt_category=PromptCategory.CONCEPT_EXPLANATION,
+            activity_phase=ActivityPhase.IN_ACTIVITY,
+            candidate_timing_action=CandidateTimingAction.DURING_ACTIVITY,
+            suggested_content_granularity=ContentGranularity.ONE_LINE_ANSWER,
+            priority=PromptPriority.P1,
+            confidence=0.72 if terms else 0.66,
+            matched_terms=tuple(terms or ["term_explanation_pattern"]),
+            reason="Detected unfamiliar term, concept, acronym, or definition explanation need.",
+        )
+    ]
+
+
 def _question_candidates(text: str) -> list[RuleCandidate]:
     terms = _matched_terms(text, QUESTION_TERMS)
     if not terms:
@@ -368,6 +414,10 @@ def _matched_terms(text: str, terms: tuple[str, ...]) -> list[str]:
 
 def _normalize(text: str) -> str:
     return text.strip().lower()
+
+
+def _looks_like_term_explanation_need(text: str) -> bool:
+    return bool(re.search(r"[a-z][a-z0-9+\-_/]{2,}\s*(是|指|代表|怎么|如何|what|mean)", text, re.IGNORECASE))
 
 
 def _dedupe(values: list[str]) -> list[str]:

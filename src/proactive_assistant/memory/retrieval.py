@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,6 +16,11 @@ from proactive_assistant.memory.contracts import (
     MemorySearchResult,
     MemoryType,
     MemoryUsePolicy,
+)
+from proactive_assistant.memory.query_understanding import (
+    QueryUnderstandingRequest,
+    QueryUnderstandingResult,
+    QueryUnderstandingService,
 )
 from proactive_assistant.memory.store import MemoryRepository
 from proactive_assistant.memory.vector_store import (
@@ -69,6 +75,8 @@ class StructuredMemoryQuery:
     target_confidence: float
     keywords: list[str]
     normalized_dates: list[str]
+    time_window_start: str | None
+    time_window_end: str | None
     preferred_memory_types: list[str]
     reference_time: datetime
 
@@ -88,20 +96,28 @@ class MemoryRetriever:
         embedding_client: EmbeddingClient | None = None,
         vector_store: MemoryVectorStore | None = None,
         embedding_model: str | None = None,
+        query_understanding: QueryUnderstandingService | None = None,
     ) -> None:
         self.store = store
         self._embedding_client = embedding_client
         self._vector_store = vector_store
         self._embedding_model = embedding_model
+        # PR2: when set, the retriever consults the LLM-backed query
+        # understanding service before falling back to rule-based
+        # extraction. Low confidence or call failure -> rules.
+        self._query_understanding = query_understanding
 
     def retrieve(self, query: MemoryQuery) -> MemoryContext:
-        structured = build_structured_query(query)
+        understood = self._run_query_understanding(query)
+        structured = build_structured_query(query, understood=understood)
         candidates = self._candidate_pool(query, structured)
         semantic_scores = self._semantic_scores(query, candidates)
         if structured.intent in {
             MemoryRetrievalIntent.LOOKUP_DEADLINE,
             MemoryRetrievalIntent.LOOKUP_OWNER,
             MemoryRetrievalIntent.LOOKUP_STATUS,
+            MemoryRetrievalIntent.LOOKUP_TASK_LIST,
+            MemoryRetrievalIntent.LOOKUP_SCHEDULE,
         }:
             results = self._exact_lookup(candidates, query, structured)
         else:
@@ -119,6 +135,8 @@ class MemoryRetriever:
                 "query_text": "",
                 "include_pending": include_pending,
                 "limit": 200,
+                "time_window_start": structured.time_window_start,
+                "time_window_end": structured.time_window_end,
             }
         )
         return self.store.list_memories(base_query)
@@ -137,9 +155,6 @@ class MemoryRetriever:
                 continue
             feature_score = _exact_feature_score(memory, structured)
             if feature_score <= 0.0:
-                continue
-            confidence_gate = target_strength if structured.target_entity else 0.45
-            if confidence_gate < 0.25:
                 continue
             score = round(min(1.0, 0.65 * feature_score + 0.25 * target_strength + 0.10 * memory.confidence), 4)
             use_policy = _use_policy(memory, query)
@@ -261,19 +276,107 @@ class MemoryRetriever:
             for memory_id, embedding in memory_embeddings.items()
         }
 
+    def _run_query_understanding(self, query: MemoryQuery) -> QueryUnderstandingResult | None:
+        if self._query_understanding is None:
+            return None
+        # Cost gate: query understanding is only worth an LLM round trip
+        # for categories whose queries are actual information requests.
+        # Plain statements flowing through per-segment memory retrieval
+        # (summary checks, suggestions, concept lookups) keep the rule
+        # path; this caps LLM usage at the question-shaped traffic.
+        if not _query_understanding_applies(query.prompt_category):
+            return None
+        reference_time = query.reference_time or datetime.now(UTC)
+        request = QueryUnderstandingRequest(
+            query_text=query.query_text.strip(),
+            prompt_category=query.prompt_category,
+            recent_transcript_text=query.recent_transcript_text,
+            active_entities=_query_understanding_entities(query.active_entities),
+            reference_date_iso=reference_time.date().isoformat(),
+        )
+        try:
+            return self._query_understanding.understand(request)
+        except Exception:
+            return None
 
-def build_structured_query(query: MemoryQuery) -> StructuredMemoryQuery:
+
+def build_structured_query(
+    query: MemoryQuery,
+    *,
+    understood: QueryUnderstandingResult | None = None,
+) -> StructuredMemoryQuery:
     reference_time = query.reference_time or datetime.now(UTC)
-    target_entity, target_confidence = _resolve_target_entity(query)
+    inferred_start, inferred_end = _infer_query_time_window(query.query_text, reference_time)
+    if understood is not None:
+        target_entity = _strip_time_expressions(understood.target_entity or "")
+        target_confidence = understood.target_entity_confidence
+        time_window_start = understood.time_window_start or inferred_start
+        time_window_end = understood.time_window_end or inferred_end
+        normalized_dates = _dates_from_understood(understood)
+        intent = MemoryRetrievalIntent(understood.intent)
+    else:
+        target_entity, target_confidence = _resolve_target_entity(query)
+        target_entity = _strip_time_expressions(target_entity or "")
+        time_window_start = query.time_window_start or inferred_start
+        time_window_end = query.time_window_end or inferred_end
+        normalized_dates = _normalize_dates(query.query_text, reference_time)
+        intent = _classify_intent(query.query_text, query.prompt_category)
     return StructuredMemoryQuery(
-        intent=_classify_intent(query.query_text, query.prompt_category),
+        intent=intent,
         target_entity=_normalize_entity_text(target_entity) if target_entity else None,
         target_confidence=target_confidence,
         keywords=_extract_keywords(" ".join([query.query_text, query.recent_transcript_text])),
-        normalized_dates=_normalize_dates(query.query_text, reference_time),
+        normalized_dates=normalized_dates,
+        time_window_start=time_window_start,
+        time_window_end=time_window_end,
         preferred_memory_types=_preferred_memory_types(query.prompt_category),
         reference_time=reference_time,
     )
+
+
+def _dates_from_understood(understood: QueryUnderstandingResult) -> list[str]:
+    return sorted(
+        {
+            value
+            for value in [understood.time_window_start, understood.time_window_end]
+            if value and value != "未定"
+        }
+    )
+
+
+_QUERY_UNDERSTANDING_CATEGORIES: frozenset[str] = frozenset(
+    {
+        PromptCategory.QUESTION_ANSWER.value,
+        PromptCategory.PERSON_OR_FACT.value,
+    }
+)
+
+
+def _query_understanding_applies(prompt_category: PromptCategory | str | None) -> bool:
+    """P1-2 gate: only question-shaped categories get the LLM call.
+
+    ``None`` (the per-segment base retrieval in the product flow carries
+    no category) is disabled: plain meeting speech flowing through
+    per-segment retrieval must not consume an LLM round trip each turn.
+    Direct API callers who want LLM understanding pass an explicit
+    ``prompt_category`` (e.g. ``question_answer``) on /memory-context.
+    """
+
+    if prompt_category is None:
+        return False
+    value = prompt_category.value if hasattr(prompt_category, "value") else str(prompt_category)
+    return value in _QUERY_UNDERSTANDING_CATEGORIES
+
+
+def _query_understanding_entities(active_entities: list[dict[str, Any]]) -> list[str]:
+    entities = []
+    for entity in active_entities:
+        normalized = _normalize_entity_payload(entity)
+        names = [normalized["canonical_name"], *normalized["aliases"]]
+        text = ", ".join(name for name in names if name)
+        if text:
+            entities.append(text)
+    return entities
 
 
 def _classify_intent(query_text: str, prompt_category: PromptCategory | str | None) -> MemoryRetrievalIntent:
@@ -355,6 +458,10 @@ def _supports_exact_intent(memory: MemoryRecord, intent: MemoryRetrievalIntent) 
         )
     if intent == MemoryRetrievalIntent.LOOKUP_STATUS:
         return bool(metadata.get("status") or _has_any(memory.text.lower(), STATUS_TERMS))
+    if intent == MemoryRetrievalIntent.LOOKUP_TASK_LIST:
+        return memory_type == MemoryType.ACTION_ITEM.value
+    if intent == MemoryRetrievalIntent.LOOKUP_SCHEDULE:
+        return bool(metadata.get("normalized_start_time") or metadata.get("normalized_end_time"))
     return False
 
 
@@ -372,6 +479,16 @@ def _exact_feature_score(memory: MemoryRecord, structured: StructuredMemoryQuery
         if metadata.get("status"):
             return 1.0
         return 0.55 if _has_any(memory.text.lower(), STATUS_TERMS) else 0.0
+    if structured.intent == MemoryRetrievalIntent.LOOKUP_TASK_LIST:
+        if memory.memory_type != MemoryType.ACTION_ITEM.value:
+            return 0.0
+        return 0.3 if str(metadata.get("status", "")).lower() == "done" else 1.0
+    if structured.intent == MemoryRetrievalIntent.LOOKUP_SCHEDULE:
+        if metadata.get("normalized_start_time") or metadata.get("normalized_end_time"):
+            return 1.0
+        if metadata.get("normalized_deadline") or metadata.get("deadline"):
+            return 0.7
+        return 0.0
     return 0.0
 
 
@@ -642,6 +759,52 @@ def _normalize_dates(text: str, reference_time: datetime) -> list[str]:
         resolved = week_start + timedelta(days=weekday_map[weekday])
         dates.append(resolved.isoformat())
     return sorted(set(dates))
+
+
+def _infer_query_time_window(query_text: str, reference_time: datetime) -> tuple[str | None, str | None]:
+    if match := re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})[日号]", query_text):
+        year, month, day = (int(group) for group in match.groups())
+        return _safe_iso_date(year, month, day), _safe_iso_date(year, month, day)
+    if match := re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", query_text):
+        year, month, day = (int(group) for group in match.groups())
+        return _safe_iso_date(year, month, day), _safe_iso_date(year, month, day)
+    if match := re.search(r"(20\d{2})年(\d{1,2})月", query_text):
+        return _month_window(int(match.group(1)), int(match.group(2)))
+    if match := re.search(r"(20\d{2})-(\d{1,2})(?!-\d)", query_text):
+        return _month_window(int(match.group(1)), int(match.group(2)))
+    if match := re.search(r"(?<!\d)(\d{1,2})月(?!\d+[日号])", query_text):
+        return _month_window(reference_time.year, int(match.group(1)))
+    return None, None
+
+
+def _month_window(year: int, month: int) -> tuple[str | None, str | None]:
+    if not 1 <= month <= 12:
+        return None, None
+    last_day = monthrange(year, month)[1]
+    return f"{year:04d}-{month:02d}-01", f"{year:04d}-{month:02d}-{last_day:02d}"
+
+
+def _safe_iso_date(year: int, month: int, day: int) -> str | None:
+    if not 1 <= month <= 12:
+        return None
+    if not 1 <= day <= monthrange(year, month)[1]:
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _strip_time_expressions(text: str) -> str:
+    stripped = text
+    patterns = [
+        r"20\d{2}年\d{1,2}月\d{1,2}[日号]?",
+        r"20\d{2}年\d{1,2}月",
+        r"20\d{2}-\d{1,2}-\d{1,2}",
+        r"20\d{2}-\d{1,2}",
+        r"\d{1,2}月\d{1,2}[日号]",
+        r"\d{1,2}月",
+    ]
+    for pattern in patterns:
+        stripped = re.sub(pattern, "", stripped)
+    return re.sub(r"\s+", " ", stripped).strip(" -_，,。；;：:")
 
 
 def _term_weight(term: str) -> float:

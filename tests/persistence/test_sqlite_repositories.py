@@ -226,7 +226,7 @@ def test_sqlite_product_flow_persists_runtime_and_memory_after_reopen(tmp_path: 
     assert context.memory_refs == [f"memory:{memory.memory_id}"]
 
 
-def _product_service(db_path: Path) -> ProductAssistantService:
+def _product_service(db_path: Path, *, auto_memory_snapshot: bool = False) -> ProductAssistantService:
     prompt_service = PromptGenerationService(
         model_client=FakeModelClient(_valid_prompt_response()),
         settings=ModelGatewaySettings(default_model="gpt-test"),
@@ -236,6 +236,7 @@ def _product_service(db_path: Path) -> ProductAssistantService:
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=PromptRuntimeService(SQLiteRuntimeStore(db_path)),
         memory_service=MemoryService(SQLiteMemoryStore(db_path)),
+        auto_memory_snapshot=auto_memory_snapshot,
     )
 
 

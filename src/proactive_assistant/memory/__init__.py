@@ -45,6 +45,7 @@ from proactive_assistant.memory.evaluation import (
     evaluate_memory_extraction_fixtures,
     load_memory_extraction_fixture_cases,
 )
+from proactive_assistant.memory.explanation_writer import ExplanationMemoryWriter
 from proactive_assistant.memory.retrieval import MemoryRetriever, build_structured_query
 from proactive_assistant.memory.service import MemoryService
 from proactive_assistant.memory.snapshot import memory_candidates_from_meeting_state
@@ -85,6 +86,7 @@ __all__ = [
     "MemoryExtractionEvaluationReport",
     "MemoryExtractionExpectedCandidate",
     "MemoryExtractionFixtureCase",
+    "ExplanationMemoryWriter",
     "MemoryForgetResult",
     "MemoryMergeAction",
     "MemoryMergeDecision",

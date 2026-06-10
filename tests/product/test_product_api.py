@@ -2,6 +2,12 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from proactive_assistant.asr import (
+    FakeSpeechRecognizer,
+    FakeStreamingSpeechRecognizer,
+    SpeechRecognitionService,
+    StreamingSpeechRecognitionService,
+)
 from proactive_assistant.model_gateway import FakeModelClient
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptOrchestrator
@@ -64,6 +70,9 @@ def create_client(
     response: dict[str, Any] | None = None,
     *,
     extraction_response: dict[str, Any] | None = None,
+    speech_recognizer: FakeSpeechRecognizer | None = None,
+    streaming_speech_recognizer: FakeStreamingSpeechRecognizer | None = None,
+    auto_memory_snapshot: bool = True,
 ) -> TestClient:
     model_client = FakeModelClient(response or valid_prompt_response())
     prompt_service = PromptGenerationService(
@@ -83,6 +92,13 @@ def create_client(
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=PromptRuntimeService(),
         memory_extraction_service=memory_extraction_service,
+        speech_recognition_service=SpeechRecognitionService(speech_recognizer) if speech_recognizer is not None else None,
+        streaming_speech_recognition_service=(
+            StreamingSpeechRecognitionService(streaming_speech_recognizer)
+            if streaming_speech_recognizer is not None
+            else None
+        ),
+        auto_memory_snapshot=auto_memory_snapshot,
     )
     app = create_app(service)
     app.state.fake_model_client = model_client
@@ -181,6 +197,88 @@ def test_append_transcript_generates_prompt_and_updates_meeting_state() -> None:
     assert payload["prompts"][0]["glasses_text"] == "这个风险还没有明确 owner 和截止时间。"
 
 
+def test_asr_transcribe_endpoint_returns_text_from_audio_payload() -> None:
+    speech = FakeSpeechRecognizer(text="这个问题谁负责，下周五 deadline 前能不能定？")
+    client = create_client(speech_recognizer=speech)
+
+    response = client.post(
+        "/asr/transcribe?language=zh-CN",
+        content=b"fake-wav-bytes",
+        headers={"content-type": "audio/wav"},
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["provider"] == "fake"
+    assert payload["text"].startswith("这个问题谁负责")
+    assert speech.requests[0]["content_type"] == "audio/wav"
+
+
+def test_audio_transcript_endpoint_transcribes_appends_and_generates_prompt() -> None:
+    speech = FakeSpeechRecognizer(text="这个问题谁负责，下周五 deadline 前能不能定？")
+    client = create_client(speech_recognizer=speech)
+    create_session(client)
+
+    response = client.post(
+        "/sessions/session_api_001/audio-transcript?speaker=Bao&start_ms=0&end_ms=900&segment_id=seg_audio_0",
+        content=b"fake-wav-bytes",
+        headers={"content-type": "audio/wav"},
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["transcription"]["text"].startswith("这个问题谁负责")
+    assert payload["transcript_step"]["transcript_segment"]["segment_id"] == "seg_audio_0"
+    assert payload["transcript_step"]["transcript_segment"]["source"] == "uploaded_audio_transcript"
+    assert payload["transcript_step"]["prompts"][0]["prompt_category"] == "summary_gap_check"
+
+
+def test_streaming_asr_websocket_appends_final_transcript_and_generates_prompt() -> None:
+    streaming = FakeStreamingSpeechRecognizer(
+        partial_text="这个问题谁负责",
+        final_text="这个问题谁负责，下周五 deadline 前能不能定？",
+    )
+    client = create_client(streaming_speech_recognizer=streaming)
+    create_session(client)
+
+    with client.websocket_connect("/sessions/session_api_001/asr/stream?speaker=Bao&language=zh-CN") as websocket:
+        opened = websocket.receive_json()
+        websocket.send_bytes(b"\0" * 3200)
+        websocket.send_json({"type": "stop"})
+        events = [opened]
+        for _ in range(5):
+            event = websocket.receive_json()
+            events.append(event)
+            if event["type"] == "final_transcript":
+                break
+
+    final = next(event for event in events if event["type"] == "final_transcript")
+    assert final["transcription"]["text"].startswith("这个问题谁负责")
+    assert final["transcript_step"]["transcript_segment"]["source"] == "live_asr_future"
+    assert final["transcript_step"]["prompts"][0]["prompt_category"] == "summary_gap_check"
+    assert final["transcript_step"]["prompts"][0]["should_display"] is True
+    assert streaming.sessions[0].received_audio == [b"\0" * 3200]
+
+
+def test_streaming_asr_websocket_returns_error_when_not_configured() -> None:
+    client = create_client()
+    create_session(client)
+
+    with client.websocket_connect("/sessions/session_api_001/asr/stream?speaker=Bao") as websocket:
+        event = websocket.receive_json()
+
+    assert event["type"] == "error"
+    assert "streaming speech recognition service is not configured" in event["detail"]
+
+
+def test_asr_endpoint_returns_503_when_not_configured() -> None:
+    client = create_client()
+
+    response = client.post("/asr/transcribe", content=b"fake-wav-bytes", headers={"content-type": "audio/wav"})
+
+    assert response.status_code == 503
+
+
 def test_get_meeting_state_endpoint_after_transcript() -> None:
     client = create_client()
     create_session(client)
@@ -192,6 +290,94 @@ def test_get_meeting_state_endpoint_after_transcript() -> None:
     payload = response.json()
     assert payload["session_id"] == "session_api_001"
     assert payload["meeting_state"]["utterances"][0]["text"].startswith("这个问题谁负责")
+
+
+def test_session_state_and_transcript_endpoints_return_product_view() -> None:
+    client = create_client()
+    create_session(client)
+    step = append_gap_transcript(client)
+
+    state = client.get("/sessions/session_api_001/state")
+    transcript = client.get("/sessions/session_api_001/transcript")
+
+    assert state.status_code == 200
+    assert state.json()["session"]["session_id"] == "session_api_001"
+    assert state.json()["transcript"][0]["segment_id"] == "seg_0"
+    assert state.json()["prompts"][0]["decision_id"] == step["prompts"][0]["decision_id"]
+    assert transcript.status_code == 200
+    assert transcript.json()["transcript"][0]["text"].startswith("这个问题谁负责")
+
+
+def test_session_lifecycle_endpoints_pause_resume_and_end() -> None:
+    client = create_client()
+    create_session(client)
+
+    paused = client.post("/sessions/session_api_001/pause")
+    resumed = client.post("/sessions/session_api_001/resume")
+    ended = client.post("/sessions/session_api_001/end")
+
+    assert paused.status_code == 200
+    assert paused.json()["session"]["status"] == "paused"
+    assert resumed.status_code == 200
+    assert resumed.json()["session"]["status"] == "running"
+    assert ended.status_code == 200
+    assert ended.json()["session"]["status"] == "ended"
+    append_after_end = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 1000,
+                "end_ms": 1900,
+                "text": "结束后不能继续追加。",
+            }
+        },
+    )
+    assert append_after_end.status_code == 400
+
+
+def test_summary_endpoint_generates_app_summary_prompt() -> None:
+    client = create_client(
+        valid_prompt_response(
+            content_granularity=3,
+            glasses_title="会议总结",
+            glasses_text="已整理关键结论、待办和未确认 GAP。",
+            app_detail_text="总结：需要确认负责人、deadline 和下一步风险处理。",
+            source_refs=["transcript:seg_0"],
+        )
+    )
+    create_session(client)
+    append_gap_transcript(client)
+
+    response = client.post("/sessions/session_api_001/summary", json={"use_memory": False})
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["session"]["session_id"] == "session_api_001"
+    assert payload["prompts"][0]["prd_surface"] == "app_summary_tab"
+    assert payload["prompts"][0]["glasses_title"] == "会议总结"
+    assert payload["decisions"][0]["policy_version"] == "product_summary_v0"
+
+
+def test_end_session_can_return_summary_payload() -> None:
+    client = create_client(
+        valid_prompt_response(
+            content_granularity=3,
+            glasses_title="会议总结",
+            glasses_text="已整理关键结论、待办和未确认 GAP。",
+            app_detail_text="总结：需要确认负责人、deadline 和下一步风险处理。",
+            source_refs=["transcript:seg_0"],
+        )
+    )
+    create_session(client)
+    append_gap_transcript(client)
+
+    response = client.post("/sessions/session_api_001/end", json={"generate_summary": True, "use_memory": False})
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["session"]["status"] == "ended"
+    assert payload["summary"]["prompts"][0]["prd_surface"] == "app_summary_tab"
 
 
 def test_list_prompts_for_session() -> None:
@@ -231,8 +417,190 @@ def test_record_feedback_computes_reward_and_memory_candidate() -> None:
     assert candidates.json()["memory_candidates"][0]["memory_candidate_id"] == payload["memory_candidates"][0]["memory_candidate_id"]
 
 
-def test_confirmed_memory_context_is_returned_and_used_by_transcript_endpoint() -> None:
+def test_record_feedback_accepts_device_feedback_taxonomy() -> None:
     client = create_client()
+    create_session(client)
+    step = append_gap_transcript(client)
+    decision_id = step["prompts"][0]["decision_id"]
+
+    response = client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={
+            "signal_type": "head_shake_reject",
+            "event_id": "fb_head_shake",
+            "input_channel": "gesture",
+            "target": "timing",
+            "display_strategy": "auto_popup",
+            "propose_memory": False,
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["feedback_event"]["signal_type"] == "head_shake_reject"
+    assert payload["feedback_event"]["input_channel"] == "gesture"
+    assert payload["feedback_event"]["target"] == "timing"
+    assert payload["feedback_event"]["display_strategy"] == "auto_popup"
+    assert payload["reward_observation"]["components"]["timing_fit"] < 0
+    assert payload["reward_observation"]["final_reward"] < 0
+    assert payload["memory_candidates"] == []
+
+
+def test_record_manual_request_on_suppressed_prompt_returns_missed_opportunity_reward() -> None:
+    client = create_client(
+        {
+            "should_prompt": False,
+            "content_granularity": 0,
+            "confidence": 0.31,
+            "privacy_risk": 0.05,
+            "rationale": "上下文不足，不主动打断。",
+        }
+    )
+    create_session(client)
+    step = client.post(
+        "/sessions/session_api_001/transcript",
+        json={
+            "segment_id": "seg_0",
+            "segment": {
+                "speaker": "Bao",
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "腾讯是哪一年成立的？",
+                "asr_confidence": 0.94,
+            },
+        },
+    ).json()
+    decision_id = step["prompts"][0]["decision_id"]
+
+    response = client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={
+            "signal_type": "manual_request",
+            "event_id": "fb_manual_request",
+            "input_channel": "touch",
+            "display_strategy": "manual_response",
+            "propose_memory": False,
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["feedback_event"]["target"] == "timing"
+    assert payload["feedback_event"]["input_channel"] == "touch"
+    assert payload["feedback_event"]["display_strategy"] == "manual_response"
+    assert payload["reward_observation"]["components"]["missed_opportunity"] == 1.0
+    assert payload["reward_observation"]["final_reward"] < -1.0
+
+
+def test_policy_episode_endpoint_exports_session_steps() -> None:
+    client = create_client()
+    create_session(client)
+    step = append_gap_transcript(client)
+    decision_id = step["prompts"][0]["decision_id"]
+    feedback = client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={"signal_type": "nod_accept", "event_id": "fb_nod", "propose_memory": False},
+    ).json()
+
+    response = client.get("/sessions/session_api_001/policy-episode")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["session"]["session_id"] == "session_api_001"
+    assert payload["episode"]["session_id"] == "session_api_001"
+    assert payload["episode"]["feedback_event_count"] == 1
+    assert payload["episode"]["rewarded_step_count"] == 1
+    assert payload["episode"]["total_reward"] == feedback["reward_observation"]["final_reward"]
+    assert payload["episode"]["steps"][0]["decision_id"] == decision_id
+    assert payload["episode"]["steps"][0]["state"]["timing_action"] == "during_activity"
+    assert payload["episode"]["steps"][0]["action"]["display_strategy"] == "auto_popup"
+    assert payload["episode"]["steps"][0]["feedback_events"][0]["signal_type"] == "nod_accept"
+
+
+def test_policy_evaluation_endpoint_exports_session_metrics() -> None:
+    client = create_client()
+    create_session(client)
+    step = append_gap_transcript(client)
+    decision_id = step["prompts"][0]["decision_id"]
+    feedback = client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={"signal_type": "head_shake_reject", "event_id": "fb_head_shake", "propose_memory": False},
+    ).json()
+
+    response = client.get("/sessions/session_api_001/policy-evaluation")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["session"]["session_id"] == "session_api_001"
+    assert payload["report"]["session_id"] == "session_api_001"
+    assert payload["report"]["summary"]["step_count"] == 1
+    assert payload["report"]["summary"]["negative_feedback_rate"] == 1.0
+    assert payload["report"]["summary"]["total_reward"] == feedback["reward_observation"]["final_reward"]
+    assert payload["report"]["by_prompt_category"][0]["value"] == "summary_gap_check"
+    assert payload["report"]["by_display_strategy"][0]["value"] == "auto_popup"
+
+
+def test_policy_baselines_endpoint_exports_baseline_audit() -> None:
+    client = create_client(
+        {
+            "should_prompt": False,
+            "content_granularity": 0,
+            "confidence": 0.31,
+            "privacy_risk": 0.05,
+            "rationale": "当前先静默。",
+        }
+    )
+    create_session(client)
+    step = append_gap_transcript(client)
+    decision_id = step["prompts"][0]["decision_id"]
+    client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={"signal_type": "manual_request", "event_id": "fb_manual", "propose_memory": False},
+    )
+
+    response = client.get("/sessions/session_api_001/policy-baselines")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["session"]["session_id"] == "session_api_001"
+    assert payload["report"]["session_id"] == "session_api_001"
+    assert {baseline["baseline_name"] for baseline in payload["report"]["baselines"]} == {
+        "conservative",
+        "balanced",
+        "aggressive",
+    }
+    balanced = [baseline for baseline in payload["report"]["baselines"] if baseline["baseline_name"] == "balanced"][0]
+    assert balanced["metrics"]["missed_opportunity_coverage_rate"] == 1.0
+    assert balanced["decisions"][0]["missed_opportunity_covered"] is True
+
+
+def test_policy_export_endpoint_exports_training_examples() -> None:
+    client = create_client()
+    create_session(client)
+    step = append_gap_transcript(client)
+    decision_id = step["prompts"][0]["decision_id"]
+    feedback = client.post(
+        f"/prompt-decisions/{decision_id}/feedback",
+        json={"signal_type": "nod_accept", "event_id": "fb_export_nod", "propose_memory": False},
+    ).json()
+
+    response = client.get("/sessions/session_api_001/policy-export")
+
+    payload = response.json()
+    example = payload["export"]["examples"][0]
+    assert response.status_code == 200
+    assert payload["session"]["session_id"] == "session_api_001"
+    assert payload["export"]["session_id"] == "session_api_001"
+    assert payload["export"]["example_count"] == 1
+    assert payload["export"]["evaluation_summary"]["total_reward"] == feedback["reward_observation"]["final_reward"]
+    assert example["decision_id"] == decision_id
+    assert example["label"]["accepted"] is True
+    assert example["label"]["final_reward"] == feedback["reward_observation"]["final_reward"]
+    assert len(example["baseline_decisions"]) == 3
+
+
+def test_confirmed_memory_context_is_returned_and_used_by_transcript_endpoint() -> None:
+    client = create_client(auto_memory_snapshot=False)
     create_session(client)
     step = append_gap_transcript(client)
     decision_id = step["prompts"][0]["decision_id"]
@@ -272,7 +640,7 @@ def test_confirmed_memory_context_is_returned_and_used_by_transcript_endpoint() 
 
 
 def test_memory_snapshot_endpoint_can_preview_and_commit_meeting_state_memories() -> None:
-    client = create_client()
+    client = create_client(auto_memory_snapshot=False)
     create_session(client)
     append_gap_transcript(client)
 
@@ -295,7 +663,7 @@ def test_memory_snapshot_endpoint_can_preview_and_commit_meeting_state_memories(
 
 
 def test_memory_extraction_endpoint_extracts_and_commits_llm_candidates() -> None:
-    client = create_client(extraction_response=valid_memory_extraction_response())
+    client = create_client(extraction_response=valid_memory_extraction_response(), auto_memory_snapshot=False)
     create_session(client)
     transcript_response = client.post(
         "/sessions/session_api_001/transcript",
@@ -492,7 +860,7 @@ def test_memory_promote_endpoint_makes_approved_memory_visible_to_later_session(
 
 
 def test_reject_and_archive_memory_endpoints_hide_memory_context() -> None:
-    client = create_client()
+    client = create_client(auto_memory_snapshot=False)
     create_session(client)
     step = append_gap_transcript(client)
     decision_id = step["prompts"][0]["decision_id"]
@@ -525,14 +893,28 @@ def test_reject_and_archive_memory_endpoints_hide_memory_context() -> None:
 def test_unknown_session_and_decision_return_404() -> None:
     client = create_client()
 
+    session_state_response = client.get("/sessions/missing/state")
     state_response = client.get("/sessions/missing/meeting-state")
+    transcript_response = client.get("/sessions/missing/transcript")
+    pause_response = client.post("/sessions/missing/pause")
+    summary_response = client.post("/sessions/missing/summary")
+    evaluation_response = client.get("/sessions/missing/policy-evaluation")
+    baseline_response = client.get("/sessions/missing/policy-baselines")
+    export_response = client.get("/sessions/missing/policy-export")
     feedback_response = client.post(
         "/prompt-decisions/missing/feedback",
         json={"signal_type": "accept"},
     )
     memory_response = client.post("/memories/missing/confirm")
 
+    assert session_state_response.status_code == 404
     assert state_response.status_code == 404
+    assert transcript_response.status_code == 404
+    assert pause_response.status_code == 404
+    assert summary_response.status_code == 404
+    assert evaluation_response.status_code == 404
+    assert baseline_response.status_code == 404
+    assert export_response.status_code == 404
     assert feedback_response.status_code == 404
     assert memory_response.status_code == 404
 
@@ -553,3 +935,78 @@ def test_duplicate_feedback_event_returns_409() -> None:
     )
 
     assert duplicate.status_code == 409
+
+
+def test_warmup_memory_endpoint_returns_cached_context_after_session_creation() -> None:
+    """The warmup endpoint surfaces the cross-session memory that was
+    retrieved at create_session time."""
+
+    from proactive_assistant.memory import (
+        InMemoryMemoryStore,
+        MemoryRecord,
+        MemoryScope,
+        MemoryService,
+        MemorySource,
+        MemoryType,
+    )
+
+    memory_service = MemoryService(InMemoryMemoryStore())
+    memory_service.store.add_memory(
+        MemoryRecord(
+            memory_id="mem_atlas_api",
+            memory_type=MemoryType.PROJECT_CONTEXT,
+            scope=MemoryScope.USER,
+            text="Project Atlas 上周决定推迟到 Q4 发布。",
+            org_id="org_001",
+            user_id="user_001",
+            source=MemorySource.MANUAL,
+            confidence=0.9,
+            importance=0.8,
+            tags=["project_context"],
+            metadata={"canonical_entity": "Project Atlas"},
+        )
+    )
+
+    client_payload = FakeModelClient({"should_prompt": False, "content_granularity": 0, "confidence": 0.0, "privacy_level": "low", "privacy_risk": 0.0, "source_refs": []})
+    prompt_service = PromptGenerationService(
+        model_client=client_payload,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    service = ProductAssistantService(
+        session_service=SessionService(InMemorySessionStore()),
+        prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
+        runtime_service=PromptRuntimeService(),
+        memory_service=memory_service,
+    )
+    app = create_app(service)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/sessions",
+        json={
+            "session_id": "session_warmup_001",
+            "config": {
+                "title": "Project Atlas weekly sync",
+                "metadata": {
+                    "org_id": "org_001",
+                    "subject_user_id": "user_001",
+                    "project": "Project Atlas",
+                },
+            },
+        },
+    )
+    assert create_response.status_code in (200, 201)
+
+    warmup_response = client.get("/sessions/session_warmup_001/warmup-memory")
+    assert warmup_response.status_code == 200
+    body = warmup_response.json()
+
+    assert body["session_id"] == "session_warmup_001"
+    ids = [result["memory"]["memory_id"] for result in body["memory_context"]["results"]]
+    assert "mem_atlas_api" in ids
+
+
+def test_warmup_memory_endpoint_returns_404_for_unknown_session() -> None:
+    client = create_client()
+    response = client.get("/sessions/does_not_exist/warmup-memory")
+    assert response.status_code == 404

@@ -182,6 +182,21 @@ summary_gap_check
 
 Offline tests use `FakeModelClient`, so `uv run pytest` never calls OpenAI.
 
+Product prompt generation can run in three modes:
+
+```bash
+# Deterministic, lowest latency, no model call.
+export PROACTIVE_PROMPT_MODE=rules
+
+# Use the configured model only.
+export PROACTIVE_PROMPT_MODE=llm
+
+# Default for product API: use the configured model, then fall back to deterministic rules on model errors.
+export PROACTIVE_PROMPT_MODE=llm_with_rule_fallback
+```
+
+`llm_with_rule_fallback` is intended for the first online product build while RL is paused. GPT-compatible models generate the actual answer, while deterministic rules provide opportunity detection, routing, and a safe fallback if the model call fails. `rules` mode still uses the same prompt contracts, PRD surfaces, timing actions, content granularity, runtime ledger, feedback, reward, and memory context fields. It does not fabricate external facts; fact/person questions are answered from available memory context when possible, otherwise routed as a “needs verification” prompt.
+
 Live OpenAI smoke test:
 
 ```bash
@@ -823,7 +838,73 @@ record feedback
 -> commit candidates into long-term memory
 ```
 
-The service keeps API/UI callers away from internal detector, orchestration, runtime ledger, and memory store details. It still does not run real ASR, create a database, or require OpenAI during tests.
+Feedback events are now shaped for later policy learning. In addition to the original signal and polarity, each event can record:
+
+```text
+input_channel: gesture | touch | button | gaze | dwell_time | voice | system | conversation_outcome
+target: overall | timing | content | granularity | display | frequency | privacy | task_outcome | latency
+display_strategy: auto_popup | subtle_available | manual_response
+```
+
+The initial device-facing signals are:
+
+```text
+nod_accept            user accepts a shown prompt through a gesture
+head_shake_reject     user rejects a shown prompt through a gesture
+default_accept        user leaves a shown prompt undisturbed
+manual_request        user requests help while the current policy was silent/suppressed
+```
+
+`manual_request` is treated as a missed-opportunity signal when attached to a suppressed decision, so the reward observation penalizes the prior `no_action` choice instead of treating the user request as ordinary positive engagement.
+
+The runtime layer can also export a session-level policy episode:
+
+```text
+policy episode
+-> steps ordered by prompt decision time
+-> state refs: transcript ids, memory refs, opportunity metadata, timing action
+-> action snapshot: should_prompt, category, granularity, surface, display strategy, duration
+-> feedback events
+-> latest reward observation for the decision
+-> next-state refs for the following decision
+```
+
+This is the first RL-ready training view. It does not train a policy yet; it creates the stable `state -> action -> feedback -> reward -> next_state` contract needed by later bandit, offline RL, or preference-model experiments.
+
+Policy evaluation summarizes that episode into session-level and action-level metrics:
+
+```text
+policy evaluation
+-> session summary: total/average reward, accept rate, negative rate, missed opportunity rate
+-> mismatch metrics: interruption, privacy rejection, granularity mismatch, display mismatch
+-> action breakdowns: category, granularity, timing action, display strategy, shown/suppressed
+```
+
+This is still not model training. It is the measurement layer used to decide whether a deterministic policy, bandit, offline RL policy, or preference model is improving.
+
+Policy baselines audit the current episode against three deterministic strategies:
+
+```text
+conservative  fewer prompts, P0 summary gap-check only, stricter privacy threshold
+balanced      default-style policy, moderate confidence/privacy threshold
+aggressive    broader opportunity coverage, higher privacy threshold
+```
+
+Baseline reports compare actions only. They do not estimate counterfactual reward. The metrics include agreement rate, more-conservative rate, more-aggressive rate, would-prompt rate, privacy-block rate, missed-opportunity coverage, and average action delta.
+
+Policy export converts the same episode into JSONL-ready training examples:
+
+```text
+policy export
+-> one example per policy step
+-> state/action/feedback/reward/next_state
+-> deterministic baseline decisions attached to the same decision id
+-> labels: final reward, accepted, negative feedback, missed opportunity, interruption, privacy/display/granularity mismatch
+```
+
+This is still a data-contract layer, not training. It gives the later bandit/offline-RL/preference-model code a stable supervised view of the product flow without re-parsing runtime logs.
+
+The service keeps API/UI callers away from internal detector, orchestration, runtime ledger, ASR adapter, and memory store details. Tests still use fake ASR/model clients; production can enable Azure Speech, SQLite, and OpenAI-compatible models through environment variables.
 
 `ProductTranscriptStepResult` also returns the current `meeting_state`, latest `meeting_gaps`, and retrieved `MemoryContext`, so API/UI callers can inspect unresolved meeting structure and memory retrieval without invoking separate services.
 
@@ -856,23 +937,50 @@ export OPENAI_BASE_URL="http://{addr}:58081"
 export OPENAI_API_STYLE="chat_completions"
 export OPENAI_MODEL="gpt-5.5"
 
+# Optional Azure Speech ASR for audio ingestion.
+export AZURE_SPEECH_KEY="..."
+export AZURE_SPEECH_REGION="eastasia"
+export AZURE_SPEECH_LANGUAGE="zh-CN"
+
 uv run uvicorn proactive_assistant.product.api:app --reload --port 8001
 ```
+
+Azure Speech can also be configured with `AZURE_SPEECH_ENDPOINT` instead of `AZURE_SPEECH_REGION`.
+
+The backend supports two audio ingestion modes:
+
+- short audio/chunk HTTP transcription via `POST /asr/transcribe` and `POST /sessions/{session_id}/audio-transcript`;
+- realtime streaming transcription via `WS /sessions/{session_id}/asr/stream`.
+
+The streaming endpoint expects binary audio chunks encoded as raw PCM: 16 kHz, 16-bit, mono. Browser/mobile encodings such as `webm/opus` should be decoded client-side before sending, or handled by a future server-side transcoding layer.
 
 Core endpoints:
 
 ```text
 GET  /health
+POST /asr/transcribe
 POST /sessions
 GET  /sessions
 GET  /sessions/{session_id}
+GET  /sessions/{session_id}/state
+POST /sessions/{session_id}/pause
+POST /sessions/{session_id}/resume
+POST /sessions/{session_id}/end
 POST /sessions/{session_id}/transcript
+POST /sessions/{session_id}/audio-transcript
+WS   /sessions/{session_id}/asr/stream
+GET  /sessions/{session_id}/transcript
+POST /sessions/{session_id}/summary
 GET  /sessions/{session_id}/meeting-state
 GET  /sessions/{session_id}/memory-candidates
 GET  /sessions/{session_id}/memory-context
 POST /sessions/{session_id}/memory-snapshot
 POST /sessions/{session_id}/memory-extraction
 GET  /sessions/{session_id}/prompts
+GET  /sessions/{session_id}/policy-episode
+GET  /sessions/{session_id}/policy-evaluation
+GET  /sessions/{session_id}/policy-baselines
+GET  /sessions/{session_id}/policy-export
 GET  /prompts?session_id={session_id}
 POST /prompt-decisions/{decision_id}/feedback
 POST /memories/{memory_id}/confirm
@@ -915,6 +1023,31 @@ curl -X POST http://127.0.0.1:8001/sessions/session_001/transcript \
     }
   }'
 ```
+
+Realtime streaming ASR protocol:
+
+```text
+WS /sessions/session_001/asr/stream?speaker=Bao&language=zh-CN&audio_format=pcm16k
+```
+
+Client messages:
+
+```text
+binary PCM chunk
+binary PCM chunk
+{"type":"stop"}
+```
+
+Server events:
+
+```json
+{"type":"stream_opened","session_id":"session_001","speaker":"Bao","language":"zh-CN","audio_format":"pcm16k"}
+{"type":"partial_transcript","transcription":{"text":"这个问题谁负责","language":"zh-CN","confidence":0.82}}
+{"type":"final_transcript","transcription":{"text":"这个问题谁负责，下周五 deadline 前能不能定？"},"transcript_step":{"prompts":[...]}}
+{"type":"session_stopped","transcription":{"text":""}}
+```
+
+Only `final_transcript` is appended to the session and triggers the product flow. Partial transcripts are returned for UI display but do not write meeting state or memory.
 
 ## Persona Pipeline CLI
 
@@ -990,6 +1123,34 @@ Current viewer boundary:
 2. Calls the backend `POST /simulations`, `GET /state`, `POST /step`, and `POST /instructions` endpoints through a Vite `/api` proxy.
 3. Keeps agent behavior deterministic; the `Demo Actions` button only sends hard-coded structured JSON actions for integration testing.
 4. Does not include LLM planning, assistant policy learning, avatar art, feedback training UI, or a commuting scene yet.
+
+## Flutter Mobile App
+
+`apps/mobile` is the first Flutter client scaffold for the product backend. The current app covers the manual transcript flow:
+
+```text
+create session -> append transcript -> view prompts -> record feedback -> generate summary -> end session
+```
+
+Native iOS and Android platform folders have been generated. To run local checks:
+
+```bash
+cd apps/mobile
+flutter pub get
+flutter analyze
+flutter test
+flutter run
+```
+
+On macOS, run `sudo xcodebuild -license` first if Flutter or Git reports that the Xcode license has not been accepted.
+
+Start the product backend before running the app:
+
+```bash
+uv run uvicorn proactive_assistant.product.api:app --reload --host 0.0.0.0 --port 8001
+```
+
+See [Mobile README](apps/mobile/README.md) for backend URL notes and current scope.
 
 ## 2D Sandbox Direction
 

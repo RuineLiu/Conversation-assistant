@@ -1,6 +1,7 @@
 from typing import Any
 from datetime import UTC, datetime
 
+from proactive_assistant.asr import FakeSpeechRecognizer, SpeechRecognitionService
 from proactive_assistant.meeting_state import MeetingGapType
 from proactive_assistant.memory import (
     MemoryRecord,
@@ -18,7 +19,15 @@ from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptOrchestrator
 from proactive_assistant.product import ProductAssistantService
 from proactive_assistant.prompting import PromptGenerationService
-from proactive_assistant.runtime import FeedbackSignalType, MemoryCandidateType, MemoryWritePolicy, PromptRuntimeService
+from proactive_assistant.runtime import (
+    FeedbackInputChannel,
+    FeedbackSignalType,
+    FeedbackTarget,
+    MemoryCandidateType,
+    MemoryWritePolicy,
+    ProactiveDisplayStrategy,
+    PromptRuntimeService,
+)
 from proactive_assistant.sessions import InMemorySessionStore, SessionConfig, SessionService, TranscriptSegmentInput
 
 
@@ -41,7 +50,12 @@ def valid_prompt_response(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def make_product_service(response: dict[str, Any] | None = None):  # type: ignore[no-untyped-def]
+def make_product_service(
+    response: dict[str, Any] | None = None,
+    *,
+    speech_recognizer: FakeSpeechRecognizer | None = None,
+    auto_memory_snapshot: bool = True,
+):  # type: ignore[no-untyped-def]
     client = FakeModelClient(response or valid_prompt_response())
     prompt_service = PromptGenerationService(
         model_client=client,
@@ -51,6 +65,8 @@ def make_product_service(response: dict[str, Any] | None = None):  # type: ignor
         session_service=SessionService(InMemorySessionStore()),
         prompt_orchestrator=PromptOrchestrator(prompt_service=prompt_service),
         runtime_service=PromptRuntimeService(),
+        speech_recognition_service=SpeechRecognitionService(speech_recognizer) if speech_recognizer is not None else None,
+        auto_memory_snapshot=auto_memory_snapshot,
     )
     return service, client
 
@@ -118,6 +134,103 @@ def test_product_flow_appends_transcript_generates_prompt_and_logs_decision() ->
     assert "这个问题谁负责" in client.requests[0].input_text
 
 
+def test_product_flow_transcribes_audio_and_runs_prompt_flow() -> None:
+    speech = FakeSpeechRecognizer(text="这个问题谁负责，下周五 deadline 前能不能定？")
+    service, _client = make_product_service(speech_recognizer=speech)
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+
+    result = service.append_audio_transcript_and_generate_prompts(
+        session.session_id,
+        b"fake-wav-bytes",
+        speaker="Bao",
+        start_ms=0,
+        end_ms=900,
+        segment_id="seg_audio_0",
+        content_type="audio/wav",
+    )
+
+    assert result.transcription.text.startswith("这个问题谁负责")
+    assert speech.requests[0]["content_type"] == "audio/wav"
+    assert result.transcript_step is not None
+    assert result.transcript_step.transcript_segment.segment_id == "seg_audio_0"
+    assert result.transcript_step.transcript_segment.source == "uploaded_audio_transcript"
+    assert result.transcript_step.prompts[0].prompt_category == "summary_gap_check"
+
+
+def test_product_session_lifecycle_and_state_view() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+
+    paused = service.pause_session(session.session_id)
+    resumed = service.resume_session(session.session_id)
+    state = service.get_session_state(session.session_id)
+
+    assert paused.session.status == "paused"
+    assert resumed.session.status == "running"
+    assert state.session.session_id == session.session_id
+    assert state.meeting_state.session_id == session.session_id
+    assert state.transcript[0].segment_id == "seg_0"
+    assert state.prompts[0].prompt_category == "summary_gap_check"
+
+
+def test_product_flow_generates_post_session_summary_prompt() -> None:
+    service, client = make_product_service(
+        valid_prompt_response(
+            content_granularity=3,
+            glasses_title="会议总结",
+            glasses_text="已整理关键结论、待办和未确认 GAP。",
+            app_detail_text="总结：需要确认负责人、deadline 和下一步风险处理。",
+            source_refs=["transcript:seg_0"],
+        )
+    )
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+
+    result = service.generate_session_summary(session.session_id, use_memory=False)
+
+    assert result.session.session_id == session.session_id
+    assert result.prompts[0].prd_surface == "app_summary_tab"
+    assert result.prompts[0].content_granularity == 3
+    assert result.prompts[0].glasses_title == "会议总结"
+    assert result.decisions[0].policy_version == "product_summary_v0"
+    assert result.decisions[0].metadata["summary_source"] == "session_summary_v0"
+    assert "会后总结" in client.requests[-1].input_text
+
+
+def test_product_end_session_can_generate_summary() -> None:
+    service, _client = make_product_service(
+        valid_prompt_response(
+            content_granularity=3,
+            glasses_title="会议总结",
+            glasses_text="已整理关键结论、待办和未确认 GAP。",
+            app_detail_text="总结：需要确认负责人、deadline 和下一步风险处理。",
+            source_refs=["transcript:seg_0"],
+        )
+    )
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+
+    ended = service.end_session(session.session_id, generate_summary=True, use_memory=False)
+
+    assert ended.session.status == "ended"
+    assert ended.summary is not None
+    assert ended.summary.prompts[0].prd_surface == "app_summary_tab"
+    assert ended.summary.prompts[0].glasses_title == "会议总结"
+
+
 def test_product_feedback_flow_computes_reward_and_memory_candidate() -> None:
     service, _client = make_product_service()
     session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
@@ -139,6 +252,181 @@ def test_product_feedback_flow_computes_reward_and_memory_candidate() -> None:
     assert len(feedback.memories) == 1
     assert feedback.memories[0].write_status == "pending_confirmation"
     assert service.list_memory_candidates(decision_id=decision_id) == feedback.memory_candidates
+
+
+def test_product_feedback_flow_records_device_feedback_taxonomy() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+
+    feedback = service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.HEAD_SHAKE_REJECT,
+        event_id="fb_head_shake",
+        input_channel=FeedbackInputChannel.GESTURE,
+        target=FeedbackTarget.TIMING,
+        display_strategy=ProactiveDisplayStrategy.AUTO_POPUP,
+    )
+
+    assert feedback.feedback_event.signal_type == "head_shake_reject"
+    assert feedback.feedback_event.input_channel == "gesture"
+    assert feedback.feedback_event.target == "timing"
+    assert feedback.feedback_event.display_strategy == "auto_popup"
+    assert feedback.reward_observation is not None
+    assert feedback.reward_observation.components.timing_fit < 0.0
+    assert feedback.reward_observation.final_reward < 0.0
+
+
+def test_product_feedback_flow_records_manual_request_as_missed_opportunity() -> None:
+    service, _client = make_product_service(
+        {
+            "should_prompt": False,
+            "content_granularity": 0,
+            "confidence": 0.31,
+            "privacy_risk": 0.05,
+            "rationale": "上下文不足，不主动打断。",
+        }
+    )
+    session = service.create_session(SessionConfig(title="Fact recall"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("腾讯是哪一年成立的？"),
+        segment_id="seg_0",
+    )
+
+    feedback = service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.MANUAL_REQUEST,
+        event_id="fb_manual_request",
+        input_channel=FeedbackInputChannel.BUTTON,
+        display_strategy=ProactiveDisplayStrategy.MANUAL_RESPONSE,
+        propose_memory=False,
+    )
+
+    assert feedback.feedback_event.signal_type == "manual_request"
+    assert feedback.feedback_event.target == "timing"
+    assert feedback.feedback_event.input_channel == "button"
+    assert feedback.reward_observation is not None
+    assert feedback.reward_observation.components.missed_opportunity == 1.0
+    assert feedback.reward_observation.final_reward < -1.0
+    assert feedback.memory_candidates == []
+
+
+def test_product_flow_exports_policy_episode_for_session() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+    feedback = service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.NOD_ACCEPT,
+        event_id="fb_nod",
+        propose_memory=False,
+    )
+
+    result = service.get_policy_episode(session.session_id)
+
+    assert result.session.session_id == session.session_id
+    assert result.episode.session_id == session.session_id
+    assert result.episode.total_reward == feedback.reward_observation.final_reward
+    assert result.episode.steps[0].decision_id == step.prompts[0].decision_id
+    assert result.episode.steps[0].state.memory_refs == []
+    assert result.episode.steps[0].action.prompt_category == "summary_gap_check"
+    assert result.episode.steps[0].feedback_events[0].signal_type == "nod_accept"
+
+
+def test_product_flow_exports_policy_evaluation_for_session() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+    feedback = service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.HEAD_SHAKE_REJECT,
+        event_id="fb_head_shake",
+        propose_memory=False,
+    )
+
+    result = service.evaluate_policy_episode(session.session_id)
+
+    assert result.session.session_id == session.session_id
+    assert result.report.session_id == session.session_id
+    assert result.report.summary.step_count == 1
+    assert result.report.summary.negative_feedback_rate == 1.0
+    assert result.report.summary.total_reward == feedback.reward_observation.final_reward
+    assert result.report.by_prompt_category[0].value == "summary_gap_check"
+    assert result.report.by_prompt_category[0].metrics.step_count == 1
+
+
+def test_product_flow_exports_policy_baselines_for_session() -> None:
+    service, _client = make_product_service(
+        {
+            "should_prompt": False,
+            "content_granularity": 0,
+            "confidence": 0.31,
+            "privacy_risk": 0.05,
+            "rationale": "当前先静默。",
+        }
+    )
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+    service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.MANUAL_REQUEST,
+        event_id="fb_manual",
+        propose_memory=False,
+    )
+
+    result = service.evaluate_policy_baselines(session.session_id)
+
+    baselines = {baseline.baseline_name: baseline for baseline in result.report.baselines}
+    assert result.session.session_id == session.session_id
+    assert set(baselines) == {"conservative", "balanced", "aggressive"}
+    assert baselines["balanced"].metrics.missed_opportunity_coverage_rate == 1.0
+    assert baselines["balanced"].decisions[0].missed_opportunity_covered is True
+
+
+def test_product_flow_exports_policy_training_examples_for_session() -> None:
+    service, _client = make_product_service()
+    session = service.create_session(SessionConfig(title="Launch risk sync"), session_id="session_001")
+    step = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("这个问题谁负责，下周五 deadline 前能不能定？"),
+        segment_id="seg_0",
+    )
+    feedback = service.record_feedback(
+        step.prompts[0].decision_id,
+        FeedbackSignalType.NOD_ACCEPT,
+        event_id="fb_export_nod",
+        propose_memory=False,
+    )
+
+    result = service.export_policy_training_examples(session.session_id)
+
+    example = result.export.examples[0]
+    assert result.session.session_id == session.session_id
+    assert result.export.session_id == session.session_id
+    assert result.export.example_count == 1
+    assert result.export.evaluation_summary.total_reward == feedback.reward_observation.final_reward
+    assert example.decision_id == step.prompts[0].decision_id
+    assert example.label.accepted is True
+    assert example.label.final_reward == feedback.reward_observation.final_reward
+    assert example.action.prompt_category == "summary_gap_check"
+    assert len(example.baseline_decisions) == 3
 
 
 def test_product_flow_writes_meeting_state_snapshot_memory_once_and_supports_exact_lookup() -> None:
@@ -214,6 +502,7 @@ def test_product_flow_extracts_llm_memory_candidates_and_upserts_them() -> None:
             model_client=extraction_client,
             settings=ModelGatewaySettings(default_model="gpt-memory-test"),
         ),
+        auto_memory_snapshot=False,
     )
     session = service.create_session(
         SessionConfig(
@@ -310,7 +599,10 @@ def test_product_feedback_can_skip_reward_and_memory_generation() -> None:
 
 
 def test_product_flow_retrieves_confirmed_memory_into_next_prompt_snapshot() -> None:
-    service, _client = make_product_service()
+    # This test asserts the memory store is empty before user accepts a
+    # prompt; auto_memory_snapshot would populate it eagerly via the
+    # MeetingState path. Opt out so we keep testing the feedback path.
+    service, _client = make_product_service(auto_memory_snapshot=False)
     session = service.create_session(
         SessionConfig(
             title="Launch risk sync",

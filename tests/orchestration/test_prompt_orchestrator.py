@@ -1,6 +1,6 @@
 from typing import Any
 
-from proactive_assistant.model_gateway import FakeModelClient, ModelRequest
+from proactive_assistant.model_gateway import FakeModelClient, ModelGatewayError, ModelRequest
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.orchestration import PromptCandidateStatus, PromptOrchestrator
 from proactive_assistant.prompting import (
@@ -9,6 +9,7 @@ from proactive_assistant.prompting import (
     DurationPolicy,
     PRDSurface,
     PromptGenerationService,
+    RuleBasedPromptGenerationService,
 )
 from proactive_assistant.sessions import InMemorySessionStore, SessionConfig, SessionService, TranscriptSegmentInput
 
@@ -172,6 +173,31 @@ def test_orchestrator_isolates_invalid_model_output_as_failed_candidate() -> Non
     assert "ModelOutputValidationError" in candidate.reason
 
 
+def test_orchestrator_uses_rule_fallback_when_model_generation_fails() -> None:
+    def fail_request(_request: ModelRequest) -> dict[str, Any]:
+        raise ModelGatewayError("model unavailable")
+
+    client = FakeModelClient(fail_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    result = PromptOrchestrator(
+        prompt_service=prompt_service,
+        fallback_prompt_service=RuleBasedPromptGenerationService(),
+    ).run(snapshot)
+
+    candidate = result.candidates[0]
+    assert candidate.status == PromptCandidateStatus.GENERATED
+    assert candidate.prompt_result is not None
+    assert candidate.prompt_result.model_usage is not None
+    assert candidate.prompt_result.model_usage.provider == "rules"
+    assert candidate.metadata["stage"] == "prompt_generation_fallback"
+    assert "model unavailable" in candidate.metadata["fallback_reason"]
+
+
 def test_orchestrator_limits_generated_candidates() -> None:
     def response_for_request(request: ModelRequest) -> dict[str, Any]:
         return valid_prompt_response(source_refs=["transcript:seg_0"])
@@ -192,3 +218,267 @@ def test_orchestrator_limits_generated_candidates() -> None:
     assert len(result.opportunities) == 1
     assert len(result.candidates) == 1
     assert len(client.requests) == 1
+
+
+def test_orchestrator_enforces_glasses_length_caps_and_records_metadata() -> None:
+    long_text = (
+        "这个风险的负责人需要立刻确认，下周五之前必须给出明确的下一步动作，"
+        "否则会影响发布节奏，建议同步上级和相关方一起决定。"
+    )
+    prompt_service, _client = make_prompt_service(
+        valid_prompt_response(
+            glasses_title="负责人待确认",
+            glasses_text=long_text,
+            app_detail_text="",
+        )
+    )
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    result = PromptOrchestrator(prompt_service=prompt_service).run(snapshot)
+    candidate = result.candidates[0]
+
+    assert candidate.prompt_result is not None
+    # glasses_text was truncated to ≤30 CJK chars
+    visible = [
+        ch
+        for ch in candidate.prompt_result.glasses_text
+        if not ch.isspace() and ch not in "，。！？；：、,.!?;:"
+    ]
+    assert len(visible) <= 30
+    # original verbose copy preserved into app_detail_text
+    assert candidate.prompt_result.app_detail_text == long_text
+    # enforcer telemetry stored on candidate metadata
+    assert "text_truncated" in candidate.metadata["enforcement_actions"]
+    assert candidate.metadata["enforcement_enforced"] is True
+    assert candidate.metadata["enforcement_metrics"]["text_limit"] == 30
+
+
+def test_orchestrator_defers_second_glasses_show_to_app_within_cooldown() -> None:
+    from proactive_assistant.orchestration import RateLimitConfig, RateLimiter
+    from proactive_assistant.orchestration.rate_limiter import (
+        InMemoryRateLimitHistory,
+    )
+
+    class _FakeClock:
+        def __init__(self) -> None:
+            self.t = 0
+
+        def now_ms(self) -> int:
+            return self.t
+
+        def advance(self, ms: int) -> None:
+            self.t += ms
+
+    clock = _FakeClock()
+    limiter = RateLimiter(
+        config=RateLimitConfig(surface_cooldown_ms=20_000),
+        history=InMemoryRateLimitHistory(),
+        clock=clock,
+    )
+
+    def response_for_request(request: ModelRequest) -> dict[str, Any]:
+        return valid_prompt_response(source_refs=["transcript:seg_0"])
+
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    orchestrator = PromptOrchestrator(prompt_service=prompt_service, rate_limiter=limiter)
+
+    snapshot1 = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+    first = orchestrator.run(snapshot1)
+    first_candidate = first.candidates[0]
+
+    assert first_candidate.status == PromptCandidateStatus.GENERATED
+    assert first_candidate.prompt_request.prd_surface == PRDSurface.GLASSES_POPUP.value
+    assert first_candidate.metadata["rate_limit_action"] == "allow"
+
+    clock.advance(3_000)
+
+    snapshot2 = make_snapshot("这个数据为什么变化？")
+    second = orchestrator.run(snapshot2)
+    second_candidate = second.candidates[0]
+
+    assert second_candidate.status == PromptCandidateStatus.GENERATED
+    assert second_candidate.prompt_request.prd_surface == PRDSurface.APP_PROMPT_TAB.value
+    assert second_candidate.metadata["rate_limit_action"] == "defer_to_app"
+    assert "surface_cooldown" in second_candidate.metadata["rate_limit_reasons"]
+    assert second_candidate.metadata["rate_limit_new_surface"] == PRDSurface.APP_PROMPT_TAB.value
+
+
+def test_orchestrator_drops_candidate_when_no_app_fallback_configured() -> None:
+    from proactive_assistant.orchestration import RateLimitConfig, RateLimiter
+
+    class _FakeClock:
+        def __init__(self) -> None:
+            self.t = 0
+
+        def now_ms(self) -> int:
+            return self.t
+
+        def advance(self, ms: int) -> None:
+            self.t += ms
+
+    clock = _FakeClock()
+    limiter = RateLimiter(
+        config=RateLimitConfig(
+            surface_cooldown_ms=20_000,
+            drop_when_no_app_fallback=True,
+        ),
+        clock=clock,
+    )
+
+    def response_for_request(request: ModelRequest) -> dict[str, Any]:
+        return valid_prompt_response(source_refs=["transcript:seg_0"])
+
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    orchestrator = PromptOrchestrator(prompt_service=prompt_service, rate_limiter=limiter)
+
+    orchestrator.run(make_snapshot("这个问题谁负责？"))
+    clock.advance(3_000)
+    result = orchestrator.run(make_snapshot("这个数据为什么变化？"))
+    candidate = result.candidates[0]
+
+    assert candidate.status == PromptCandidateStatus.SUPPRESSED
+    assert candidate.metadata["rate_limit_action"] == "drop"
+    assert candidate.prompt_result is not None
+    assert candidate.prompt_result.should_prompt is False
+    assert candidate.prompt_result.content_granularity == ContentGranularity.NO_ACTION.value
+
+
+def test_orchestrator_post_activity_glasses_defers_immediately() -> None:
+    from proactive_assistant.orchestration import RateLimiter
+
+    def response_for_request(request: ModelRequest) -> dict[str, Any]:
+        return valid_prompt_response(source_refs=["transcript:seg_0"])
+
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    orchestrator = PromptOrchestrator(
+        prompt_service=prompt_service,
+        rate_limiter=RateLimiter(),
+    )
+
+    # build_snapshot defaults phase to in_activity. We construct an explicit
+    # post-activity opportunity via the orchestrator.generate_candidate API.
+    from proactive_assistant.detection import (
+        CandidateTimingAction,
+        DetectionRuleMatch,
+        PromptOpportunity,
+        PromptPriority,
+    )
+    from proactive_assistant.prompting import (
+        ContentGranularity as CG,
+        PrivacyLevel as PL,
+        PromptCategory as PC,
+    )
+    from proactive_assistant.schemas.scenario import ActivityPhase as AP
+
+    snapshot = make_snapshot("这个问题谁负责？")
+    opportunity = PromptOpportunity(
+        opportunity_id="opp_post_summary",
+        session_id="session_001",
+        trigger_segment_ids=["seg_0"],
+        captured_text="生成会后总结。",
+        prompt_category=PC.SUMMARY_GAP_CHECK,
+        activity_phase=AP.POST_ACTIVITY,
+        candidate_timing_action=CandidateTimingAction.AFTER_ACTIVITY,
+        suggested_content_granularity=CG.CONCISE_BULLETS,
+        priority=PromptPriority.P0,
+        confidence=0.9,
+        privacy_level=PL.LOW,
+        privacy_risk=0.1,
+        reason="post activity summary",
+        rule_matches=[
+            DetectionRuleMatch(rule_name="t", matched_terms=["s"], confidence_delta=0.0, reason="t")
+        ],
+    )
+    candidate = orchestrator.generate_candidate(snapshot, opportunity)
+
+    # AFTER_ACTIVITY timing routes to app_summary_tab by default, which is
+    # not a glasses surface — so the limiter passes through with
+    # NOT_GLASSES_SURFACE rather than POST_ACTIVITY_GLASSES.
+    assert candidate.metadata["rate_limit_action"] == "allow"
+    assert candidate.prompt_request.prd_surface == PRDSurface.APP_SUMMARY_TAB.value
+    assert "not_glasses_surface" in candidate.metadata["rate_limit_reasons"]
+
+
+def test_orchestrator_fast_paths_pre_generated_explanation_without_second_llm_call() -> None:
+    """When the detector pre-generates an explanation for an unknown term,
+    the orchestrator should build the PromptCandidate directly and skip the
+    PromptGenerationService entirely. This is the hot path for unknown-term
+    explanations: ≤1 LLM call per detection cycle.
+    """
+
+    from proactive_assistant.detection import (
+        CandidateTimingAction,
+        DetectionRuleMatch,
+        PromptOpportunity,
+        PromptPriority,
+    )
+    from proactive_assistant.prompting import (
+        ContentGranularity as CG,
+        PromptCategory as PC,
+        PrivacyLevel as PL,
+    )
+    from proactive_assistant.schemas.scenario import ActivityPhase as AP
+
+    prompt_service, client = make_prompt_service()
+    orchestrator = PromptOrchestrator(prompt_service=prompt_service)
+
+    snapshot = make_snapshot("我们这季度 GMV 增长了 20%。")
+    opportunity = PromptOpportunity(
+        opportunity_id="opp_gmv",
+        session_id="session_001",
+        trigger_segment_ids=["seg_0"],
+        captured_text="GMV",
+        prompt_category=PC.CONCEPT_EXPLANATION,
+        activity_phase=AP.IN_ACTIVITY,
+        candidate_timing_action=CandidateTimingAction.DURING_ACTIVITY,
+        suggested_content_granularity=CG.ONE_LINE_ANSWER,
+        priority=PromptPriority.P1,
+        confidence=0.85,
+        privacy_level=PL.LOW,
+        privacy_risk=0.05,
+        reason="LLM detected unfamiliar term: GMV",
+        rule_matches=[
+            DetectionRuleMatch(
+                rule_name="llm_unknown_term_detector",
+                matched_terms=["GMV"],
+                confidence_delta=0.0,
+                reason="electronic commerce term",
+            )
+        ],
+        metadata={
+            "pre_generated_explanation": "商品交易总额，电商核心指标。",
+            "unknown_term": "GMV",
+            "unknown_term_type": "acronym",
+            "unknown_term_rationale": "test",
+            "unknown_term_candidate_id": "unkterm_abc",
+            "detection_source": "llm_unknown_term_detector",
+        },
+    )
+
+    candidate = orchestrator.generate_candidate(snapshot, opportunity)
+
+    # No second LLM call was issued for prompt generation.
+    assert client.requests == []
+    assert candidate.status == PromptCandidateStatus.GENERATED
+    assert candidate.prompt_result is not None
+    assert candidate.prompt_result.glasses_title == "GMV"
+    assert candidate.prompt_result.glasses_text == "商品交易总额，电商核心指标。"
+    assert candidate.prompt_result.app_detail_text == "商品交易总额，电商核心指标。"
+    assert candidate.prompt_result.prompt_category == "concept_explanation"
+    assert candidate.prompt_result.source_refs == ["transcript:seg_0"]
+    assert candidate.prompt_result.model_usage is not None
+    assert candidate.prompt_result.model_usage.provider == "unknown_term_detector"
+    assert candidate.metadata["stage"] == "prompt_generation_fast_path"
+    assert candidate.metadata["fast_path_source"] == "llm_unknown_term_detector"

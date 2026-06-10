@@ -18,14 +18,17 @@ def opportunities_from_meeting_gaps(
     *,
     fallback_segment_id: str,
     privacy_constraints: list[str] | None = None,
+    speaker_by_segment_id: dict[str, str] | None = None,
 ) -> list[PromptOpportunity]:
     promptable_gaps = _select_promptable_gaps(gaps, fallback_segment_id=fallback_segment_id)
+    speaker_map = speaker_by_segment_id or {}
     return [
         _opportunity_from_gap(
             session_id,
             gap,
             fallback_segment_id=fallback_segment_id,
             privacy=assess_privacy(gap.text, privacy_constraints or []),
+            speaker_by_segment_id=speaker_map,
         )
         for gap in promptable_gaps
     ]
@@ -37,10 +40,16 @@ def _opportunity_from_gap(
     *,
     fallback_segment_id: str,
     privacy: PrivacyAssessment,
+    speaker_by_segment_id: dict[str, str],
 ) -> PromptOpportunity:
     trigger_segment_ids = gap.source_utterance_ids or [fallback_segment_id]
     category, phase, timing, granularity = _policy_for_gap(gap)
     priority = _priority_for_gap(gap)
+    # Inherit target_speaker_id when all triggers come from the same speaker;
+    # otherwise leave empty to signal a multi-speaker structural gap.
+    speakers_seen = {speaker_by_segment_id.get(seg_id, "") for seg_id in trigger_segment_ids}
+    speakers_seen.discard("")
+    target_speaker_id = next(iter(speakers_seen)) if len(speakers_seen) == 1 else ""
     return PromptOpportunity(
         opportunity_id=_opportunity_id(session_id, gap.gap_id),
         session_id=session_id,
@@ -64,6 +73,7 @@ def _opportunity_from_gap(
                 reason=gap.reason,
             )
         ],
+        target_speaker_id=target_speaker_id,
         metadata={
             "source": "meeting_state",
             "gap_id": gap.gap_id,

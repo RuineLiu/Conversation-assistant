@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Protocol, runtime_checkable
 
 from proactive_assistant.memory.contracts import (
@@ -15,6 +15,9 @@ from proactive_assistant.memory.contracts import (
     MemorySearchResult,
     MemoryWriteStatus,
 )
+
+
+EVENT_END_UNDEFINED = "未定"
 
 
 class MemoryStoreError(RuntimeError):
@@ -246,7 +249,79 @@ def _matches_query(memory: MemoryRecord, query: MemoryQuery) -> bool:
         return False
     if query.tags and not set(query.tags).issubset(set(memory.tags)):
         return False
+    if (query.time_window_start or query.time_window_end) and not _matches_time_window(memory, query):
+        return False
     return True
+
+
+def _matches_time_window(memory: MemoryRecord, query: MemoryQuery) -> bool:
+    query_window = _date_window(query.time_window_start, query.time_window_end, open_end_if_missing=False)
+    if query_window is None:
+        return False
+    memory_window = _memory_event_window(memory)
+    if memory_window is None:
+        return False
+
+    memory_start, memory_end = memory_window
+    query_start, query_end = query_window
+    return memory_start <= query_end and memory_end >= query_start
+
+
+def _memory_event_window(memory: MemoryRecord) -> tuple[date, date] | None:
+    metadata = memory.metadata
+    start_value = metadata.get("normalized_start_time")
+    end_value = metadata.get("normalized_end_time")
+    if not start_value and not end_value:
+        # P2-1 fallback: memories written outside the consolidation path
+        # (manual imports, legacy data) may carry only a deadline. Treat
+        # it as a single-day event window so time-bounded queries can
+        # still see them instead of silently excluding them.
+        deadline = metadata.get("normalized_deadline") or metadata.get("deadline")
+        if deadline:
+            return _date_window(deadline, deadline, open_end_if_missing=False)
+        return None
+    return _date_window(start_value, end_value, open_end_if_missing=True)
+
+
+def _date_window(
+    start_value: object | None,
+    end_value: object | None,
+    *,
+    open_end_if_missing: bool,
+) -> tuple[date, date] | None:
+    start = _parse_date(start_value)
+    end_is_undefined = _is_undefined_end(end_value)
+    end = date.max if end_is_undefined else _parse_date(end_value)
+
+    if start is None and end is None:
+        return None
+    if start is None:
+        start = end
+    if end is None:
+        end = date.max if open_end_if_missing else start
+    if start is None or end is None or start > end:
+        return None
+    return start, end
+
+
+def _parse_date(value: object | None) -> date | None:
+    if value is None or _is_undefined_end(value):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _is_undefined_end(value: object | None) -> bool:
+    return str(value).strip() == EVENT_END_UNDEFINED if value is not None else False
 
 
 def _visible_to_session(memory: MemoryRecord, session_id: str) -> bool:

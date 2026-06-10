@@ -16,6 +16,14 @@ class ModelOutputValidationError(ModelGatewayError):
     """Raised when a model response cannot be parsed into the expected schema."""
 
 
+class ModelGatewayTimeoutError(ModelGatewayError):
+    """Raised when a model call exceeds an explicit deadline.
+
+    Used by the orchestrator to enforce a tight glasses-surface budget so
+    the wearable does not present a stale popup that arrived too late.
+    """
+
+
 class ModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,42 +75,45 @@ class OpenAIResponsesClient:
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         client = self._client or self._build_client()
         started = time.perf_counter()
-        response = client.responses.create(
-            model=request.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": request.instructions,
-                        }
-                    ],
+        try:
+            response = client.responses.create(
+                model=request.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": request.instructions,
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": request.input_text,
+                            }
+                        ],
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": request.response_schema_name,
+                        "schema": request.response_schema,
+                        "strict": True,
+                    }
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": request.input_text,
-                        }
-                    ],
-                },
-            ],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": request.response_schema_name,
-                    "schema": request.response_schema,
-                    "strict": True,
-                }
-            },
-            temperature=request.temperature,
-            max_output_tokens=request.max_output_tokens,
-            store=request.store,
-            metadata=request.metadata,
-            timeout=self._timeout_seconds,
-        )
+                temperature=request.temperature,
+                max_output_tokens=request.max_output_tokens,
+                store=request.store,
+                metadata=request.metadata,
+                timeout=self._timeout_seconds,
+            )
+        except Exception as exc:
+            raise ModelGatewayError(f"OpenAI Responses request failed: {exc}") from exc
         latency_ms = int((time.perf_counter() - started) * 1000)
         parsed = _parse_response_json(response)
         usage = getattr(response, "usage", None)
@@ -179,7 +190,10 @@ class OpenAIChatCompletionsClient:
         if request.max_output_tokens is not None:
             _set_chat_max_tokens(kwargs, self._max_tokens_param, request.max_output_tokens)
 
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            raise ModelGatewayError(f"OpenAI Chat Completions request failed: {exc}") from exc
         latency_ms = int((time.perf_counter() - started) * 1000)
         parsed = _parse_chat_completion_json(response)
         usage = getattr(response, "usage", None)

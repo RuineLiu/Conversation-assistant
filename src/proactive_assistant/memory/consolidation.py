@@ -63,6 +63,10 @@ def consolidated_memory_metadata(candidate: MemoryCandidate) -> dict[str, Any]:
             "assignee",
             "deadline",
             "normalized_deadline",
+            "start_time",
+            "normalized_start_time",
+            "end_time",
+            "normalized_end_time",
             "entity",
             "canonical_entity",
             "normalized_entity",
@@ -136,6 +140,7 @@ def _fill_action_metadata(text: str, metadata: dict[str, Any], reference_time: d
     if entity:
         metadata.setdefault("normalized_entity", _normalize_entity(entity))
         metadata.setdefault("canonical_entity", entity.strip())
+    _fill_event_window(metadata, reference_time)
 
 
 def _fill_general_metadata(text: str, metadata: dict[str, Any], reference_time: datetime) -> None:
@@ -152,6 +157,67 @@ def _fill_general_metadata(text: str, metadata: dict[str, Any], reference_time: 
     entity = metadata.get("normalized_entity") or metadata.get("canonical_entity") or metadata.get("entity")
     if entity:
         metadata.setdefault("normalized_entity", _normalize_entity(str(entity)))
+    _fill_event_window(metadata, reference_time)
+
+
+# Sentinel for events whose end-time is intentionally undefined ("未定").
+EVENT_END_UNDEFINED = "未定"
+
+
+def _fill_event_window(metadata: dict[str, Any], reference_time: datetime) -> None:
+    """Populate normalized start_time / end_time from event semantics.
+
+    Rules (matching the product spec):
+      - Both start and end given  -> normalize both.
+      - Only end given           -> start = reference_time's date.
+      - Only start given         -> end = "未定".
+      - Neither but deadline set -> treat deadline as end, start = ref date.
+      - Neither anything         -> leave the fields absent so downstream
+        retrieval can still match by other features.
+    """
+
+    raw_start = metadata.get("start_time")
+    raw_end = metadata.get("end_time")
+    normalized_start = metadata.get("normalized_start_time") or (
+        _normalize_event_datetime(str(raw_start), reference_time) if raw_start else None
+    )
+    normalized_end = metadata.get("normalized_end_time")
+    if normalized_end is None and raw_end:
+        if str(raw_end).strip() == EVENT_END_UNDEFINED:
+            normalized_end = EVENT_END_UNDEFINED
+        else:
+            normalized_end = _normalize_event_datetime(str(raw_end), reference_time)
+    # Fold in deadline as a synonym for end when nothing else set it
+    if normalized_end is None:
+        candidate_end = metadata.get("normalized_deadline") or metadata.get("deadline")
+        if candidate_end:
+            normalized_end = _normalize_event_datetime(str(candidate_end), reference_time)
+    if normalized_start is None and normalized_end is not None and normalized_end != EVENT_END_UNDEFINED:
+        normalized_start = reference_time.date().isoformat()
+    if normalized_end is None and normalized_start is not None:
+        normalized_end = EVENT_END_UNDEFINED
+    if normalized_start is not None:
+        metadata.setdefault("normalized_start_time", normalized_start)
+        metadata.setdefault("start_time", raw_start or normalized_start)
+    if normalized_end is not None:
+        metadata.setdefault("normalized_end_time", normalized_end)
+        metadata.setdefault("end_time", raw_end or normalized_end)
+
+
+def _normalize_event_datetime(value: str, reference_time: datetime) -> str:
+    """Best-effort to coerce ``value`` to an ISO date string.
+
+    Reuses ``_extract_deadline`` semantics so "下周五 / 12月3日 / 12/3 /
+    2026-06-09" all flow through to ISO date. If parsing fails the
+    original string is returned (the retrieval layer can still match it
+    literally).
+    """
+
+    cleaned = value.strip()
+    if not cleaned:
+        return cleaned
+    parsed = _extract_deadline(cleaned, reference_time)
+    return parsed or cleaned
 
 
 def _extract_owner(text: str) -> str | None:

@@ -22,3 +22,10 @@ dist/
 apps/*/node_modules/
 apps/*/dist/
 apps/*/.vite/
+
+# Flutter generated outputs.
+apps/*/.dart_tool/
+apps/*/.flutter-plugins
+apps/*/.flutter-plugins-dependencies
+apps/*/.packages
+apps/*/build/

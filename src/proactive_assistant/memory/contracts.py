@@ -91,6 +91,8 @@ class MemoryRetrievalIntent(StrEnum):
     LOOKUP_OWNER = "lookup_owner"
     LOOKUP_STATUS = "lookup_status"
     LOOKUP_RATIONALE = "lookup_rationale"
+    LOOKUP_TASK_LIST = "lookup_task_list"
+    LOOKUP_SCHEDULE = "lookup_schedule"
     OPEN_RECALL = "open_recall"
 
 
@@ -174,6 +176,8 @@ class MemoryQuery(BaseModel):
     recent_transcript_text: str = ""
     active_entities: list[dict[str, Any]] = Field(default_factory=list)
     target_entity: str | None = None
+    time_window_start: str | None = None
+    time_window_end: str | None = None
     privacy_constraints: list[str] = Field(default_factory=list)
     prd_surface: PRDSurface | None = None
     reference_time: datetime | None = None
@@ -202,6 +206,11 @@ class MemoryContext(BaseModel):
     memory_context: list[str] = Field(default_factory=list)
     memory_refs: list[str] = Field(default_factory=list)
     results: list[MemorySearchResult] = Field(default_factory=list)
+    # P2-5: distinguishes "the user has no memory yet" from "memory exists
+    # but did not match this query". Allows the UI to suppress the
+    # "I remember from before..." region entirely on first use rather
+    # than render an empty placeholder.
+    is_empty_cold_start: bool = False
 
 
 class MemoryMergeDecision(BaseModel):

@@ -300,8 +300,9 @@ def _settings_from_smoke_args(args: argparse.Namespace) -> ModelGatewaySettings:
         updates["max_output_tokens"] = args.max_output_tokens
     if getattr(args, "timeout_seconds", None) is not None:
         updates["request_timeout_seconds"] = args.timeout_seconds
-    if getattr(args, "base_url", None) is not None:
-        updates["openai_base_url"] = args.base_url
+    base_url = _non_empty_arg(getattr(args, "base_url", None))
+    if base_url is not None:
+        updates["openai_base_url"] = base_url
     if getattr(args, "api_style", None) is not None:
         updates["model_api_style"] = args.api_style
     if getattr(args, "chat_response_format", None) is not None:
@@ -309,6 +310,13 @@ def _settings_from_smoke_args(args: argparse.Namespace) -> ModelGatewaySettings:
     if updates:
         settings = settings.model_copy(update=updates)
     return settings
+
+
+def _non_empty_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _model_client_from_settings(settings: ModelGatewaySettings):

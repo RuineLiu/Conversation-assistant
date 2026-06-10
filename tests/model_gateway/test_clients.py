@@ -4,6 +4,7 @@ import pytest
 
 from proactive_assistant.model_gateway import (
     FakeModelClient,
+    ModelGatewayError,
     ModelOutputValidationError,
     ModelRequest,
     OpenAIChatCompletionsClient,
@@ -74,6 +75,17 @@ def test_openai_responses_client_rejects_non_json_output() -> None:
     client = OpenAIResponsesClient(client=SimpleNamespace(responses=Responses()))
 
     with pytest.raises(ModelOutputValidationError):
+        client.generate_structured(make_request())
+
+
+def test_openai_responses_client_wraps_request_failure() -> None:
+    class Responses:
+        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("upstream unavailable")
+
+    client = OpenAIResponsesClient(client=SimpleNamespace(responses=Responses()))
+
+    with pytest.raises(ModelGatewayError, match="OpenAI Responses request failed"):
         client.generate_structured(make_request())
 
 
@@ -159,6 +171,19 @@ def test_openai_chat_completions_client_can_parse_compatible_reasoning_content()
     response = client.generate_structured(make_request())
 
     assert response.parsed == {"ok": True}
+
+
+def test_openai_chat_completions_client_wraps_request_failure() -> None:
+    class Completions:
+        def create(self, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("upstream unavailable")
+
+    client = OpenAIChatCompletionsClient(
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+    )
+
+    with pytest.raises(ModelGatewayError, match="OpenAI Chat Completions request failed"):
+        client.generate_structured(make_request())
 
 
 def test_openai_chat_completions_client_reports_empty_message_details() -> None:
