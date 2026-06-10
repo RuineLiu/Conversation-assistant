@@ -78,7 +78,8 @@ def _normalize_prompt_payload(payload: object) -> object:
     allowed_fields = set(PromptGenerationModelOutput.model_fields)
     normalized = {key: value for key, value in payload.items() if key in allowed_fields}
 
-    should_prompt = bool(normalized.get("should_prompt", False))
+    should_prompt = bool(normalized.get("should_prompt", _infer_should_prompt(normalized)))
+    normalized["should_prompt"] = should_prompt
     normalized.setdefault("content_granularity", 2 if should_prompt else 0)
     normalized.setdefault("confidence", 0.7 if should_prompt else 0.0)
     normalized.setdefault("privacy_level", "low")
@@ -95,6 +96,19 @@ def _default_privacy_risk(privacy_level: object) -> float:
     if privacy_level == "medium":
         return 0.35
     return 0.08
+
+
+def _infer_should_prompt(payload: dict[str, object]) -> bool:
+    if payload.get("prompt_category") is not None:
+        return True
+    for key in ("glasses_title", "glasses_text", "app_detail_text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    granularity = payload.get("content_granularity")
+    if isinstance(granularity, int) and granularity > 0:
+        return True
+    return False
 
 
 def _normalize_source_refs(source_refs: object) -> list[str]:

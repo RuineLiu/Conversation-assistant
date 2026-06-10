@@ -7,6 +7,7 @@ class AzureSpeechSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     speech_key: SecretStr | None = Field(
@@ -69,3 +70,74 @@ class AzureSpeechSettings(BaseSettings):
     @property
     def is_configured(self) -> bool:
         return self.speech_key is not None and bool(self.speech_region or self.speech_endpoint)
+
+
+class AliyunSpeechSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "ALIBABA_CLOUD_API_KEY",
+            "PROACTIVE_ALIYUN_ASR_API_KEY",
+        ),
+    )
+    region: str = Field(
+        default="beijing",
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_REGION",
+            "DASHSCOPE_REGION",
+            "PROACTIVE_ALIYUN_ASR_REGION",
+        ),
+    )
+    endpoint: str = Field(
+        default="wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_ENDPOINT",
+            "DASHSCOPE_WEBSOCKET_ENDPOINT",
+            "PROACTIVE_ALIYUN_ASR_ENDPOINT",
+        ),
+    )
+    model: str = Field(
+        default="paraformer-realtime-v2",
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_MODEL",
+            "DASHSCOPE_ASR_MODEL",
+            "PROACTIVE_ALIYUN_ASR_MODEL",
+        ),
+    )
+    speech_language: str = Field(
+        default="zh-CN",
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_LANGUAGE",
+            "DASHSCOPE_ASR_LANGUAGE",
+            "PROACTIVE_ALIYUN_ASR_LANGUAGE",
+        ),
+    )
+    sample_rate: int = Field(
+        default=16000,
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_SAMPLE_RATE",
+            "DASHSCOPE_ASR_SAMPLE_RATE",
+            "PROACTIVE_ALIYUN_ASR_SAMPLE_RATE",
+        ),
+    )
+    audio_format: str = Field(
+        default="pcm",
+        validation_alias=AliasChoices(
+            "ALIYUN_ASR_AUDIO_FORMAT",
+            "DASHSCOPE_ASR_AUDIO_FORMAT",
+            "PROACTIVE_ALIYUN_ASR_AUDIO_FORMAT",
+        ),
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        return self.api_key is not None

@@ -9,6 +9,8 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, W
 from pydantic import BaseModel, ConfigDict, Field
 
 from proactive_assistant.asr import (
+    AliyunDashScopeStreamingRecognizer,
+    AliyunSpeechSettings,
     AzureSpeechRestRecognizer,
     AzureSpeechSDKStreamingRecognizer,
     AzureSpeechSettings,
@@ -1243,6 +1245,8 @@ def _build_model_client(settings: ModelGatewaySettings) -> OpenAIResponsesClient
 
 
 def _build_speech_service(settings: AzureSpeechSettings | None = None) -> SpeechRecognitionService | None:
+    if _asr_provider() == "aliyun":
+        return None
     resolved_settings = settings or AzureSpeechSettings()
     if not resolved_settings.is_configured:
         return None
@@ -1250,10 +1254,22 @@ def _build_speech_service(settings: AzureSpeechSettings | None = None) -> Speech
 
 
 def _build_streaming_speech_service(settings: AzureSpeechSettings | None = None) -> StreamingSpeechRecognitionService | None:
+    provider = _asr_provider()
+    if provider == "aliyun":
+        aliyun_settings = AliyunSpeechSettings()
+        if not aliyun_settings.is_configured:
+            return None
+        return StreamingSpeechRecognitionService(AliyunDashScopeStreamingRecognizer(aliyun_settings))
+    if provider not in {"", "azure", "microsoft"}:
+        return None
     resolved_settings = settings or AzureSpeechSettings()
     if not resolved_settings.is_configured:
         return None
     return StreamingSpeechRecognitionService(AzureSpeechSDKStreamingRecognizer(resolved_settings))
+
+
+def _asr_provider() -> str:
+    return os.getenv("ASR_PROVIDER", os.getenv("PROACTIVE_ASR_PROVIDER", "azure")).strip().lower()
 
 
 def _stream_control_type(text: str) -> str:

@@ -108,6 +108,30 @@ def test_prompt_generation_service_normalizes_loose_openai_compatible_output() -
     assert not hasattr(result, "memory_update")
 
 
+def test_prompt_generation_service_inferrs_should_prompt_from_content() -> None:
+    client = FakeModelClient(
+        {
+            "prompt_category": "summary_gap_check",
+            "content_granularity": 2,
+            "glasses_title": "待确认",
+            "glasses_text": "建议确认负责人。",
+            "app_detail_text": "模型没有返回 should_prompt，但内容字段已经表明需要提示。",
+            "source_refs": ["transcript:transcript_001"],
+            "privacy_level": "low",
+        },
+        latency_ms=3,
+    )
+    service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+
+    result = service.generate_prompt(make_prompt_request())
+
+    assert result.should_prompt is True
+    assert result.glasses_title == "待确认"
+
+
 def test_prompt_generation_service_rejects_invalid_model_output() -> None:
     client = FakeModelClient(
         {
