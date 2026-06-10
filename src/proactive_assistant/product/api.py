@@ -623,7 +623,12 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                     state["last_final_end_ms"] = end_ms
                     segment_id = f"{session_id}_stream_{int(state['final_count']):04d}"
                     try:
-                        transcript_step = service.append_transcript_and_generate_prompts(
+                        # Run the full product pipeline (detection +
+                        # orchestration + potentially blocking LLM calls)
+                        # off the event loop. Doing it inline would stall
+                        # WebSocket keepalive pings and trip a 1011 close.
+                        transcript_step = await asyncio.to_thread(
+                            service.append_transcript_and_generate_prompts,
                             session_id,
                             TranscriptSegmentInput(
                                 speaker=speaker,
