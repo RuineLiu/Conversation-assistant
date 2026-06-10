@@ -244,3 +244,55 @@ def _make_memory_service_for_test() -> tuple[MemoryService, None, None]:
     from proactive_assistant.memory import InMemoryMemoryStore
 
     return MemoryService(InMemoryMemoryStore()), None, None
+
+
+def test_build_opportunity_detector_default_wires_llm_opportunity_arm() -> None:
+    from proactive_assistant.detection import OpportunityDetector
+
+    fake_client = FakeModelClient({"opportunities": [], "detection_notes": "", "safety_flags": []})
+    memory_service, _, _ = _make_memory_service_for_test()
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("PROACTIVE_OPPORTUNITY_DETECTOR", None)
+        detector = _build_opportunity_detector(
+            model_client=fake_client,
+            settings=ModelGatewaySettings(default_model="gpt-test"),
+            memory_service=memory_service,
+        )
+
+    assert isinstance(detector._opportunity_detector, OpportunityDetector)
+
+
+def test_build_opportunity_detector_opportunity_arm_disabled_by_env() -> None:
+    fake_client = FakeModelClient({"opportunities": [], "detection_notes": "", "safety_flags": []})
+    memory_service, _, _ = _make_memory_service_for_test()
+
+    with patch.dict(os.environ, {"PROACTIVE_OPPORTUNITY_DETECTOR": "off"}):
+        detector = _build_opportunity_detector(
+            model_client=fake_client,
+            settings=ModelGatewaySettings(default_model="gpt-test"),
+            memory_service=memory_service,
+        )
+
+    assert detector._opportunity_detector is None
+
+
+def test_build_opportunity_detector_arms_are_independent() -> None:
+    """Unknown-term off but opportunity on: only the opportunity arm builds."""
+    from proactive_assistant.detection import OpportunityDetector
+
+    fake_client = FakeModelClient({"opportunities": [], "detection_notes": "", "safety_flags": []})
+    memory_service, _, _ = _make_memory_service_for_test()
+
+    with patch.dict(
+        os.environ,
+        {"PROACTIVE_UNKNOWN_TERM_DETECTOR": "off", "PROACTIVE_OPPORTUNITY_DETECTOR": "on"},
+    ):
+        detector = _build_opportunity_detector(
+            model_client=fake_client,
+            settings=ModelGatewaySettings(default_model="gpt-test"),
+            memory_service=memory_service,
+        )
+
+    assert detector._unknown_term_detector is None
+    assert isinstance(detector._opportunity_detector, OpportunityDetector)

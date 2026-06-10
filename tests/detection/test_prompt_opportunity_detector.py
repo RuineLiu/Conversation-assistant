@@ -192,3 +192,80 @@ def test_detector_emits_concept_explanation_opportunity_from_llm_detector() -> N
     assert opp.metadata["unknown_term"] == "GMV"
     assert opp.metadata["unknown_term_type"] == "acronym"
     assert opp.metadata["detection_source"] == "llm_unknown_term_detector"
+
+
+def test_detector_emits_gap_opportunity_from_llm_opportunity_detector() -> None:
+    """End-to-end: the keyword rules miss "ddl" but the LLM opportunity
+    detector flags action_missing_deadline, and PromptOpportunityDetector
+    adapts it into a summary_gap_check PromptOpportunity with structured
+    metadata."""
+
+    from proactive_assistant.detection import OpportunityDetector
+    from proactive_assistant.detection.service import PromptOpportunityDetector
+    from proactive_assistant.model_gateway import FakeModelClient
+    from proactive_assistant.model_gateway.settings import ModelGatewaySettings
+    from proactive_assistant.prompting import PromptCategory
+    from proactive_assistant.sessions import (
+        InMemorySessionStore,
+        SessionConfig,
+        SessionService,
+        TranscriptSegmentInput,
+    )
+
+    response = {
+        "opportunities": [
+            {
+                "prompt_category": "summary_gap_check",
+                "gap_type": "action_missing_deadline",
+                "captured_text": "小张把项目文档给我，ddl还没定。",
+                "source_segment_id": "seg_0",
+                "owner": "小张",
+                "deadline": "",
+                "entity": "项目文档",
+                "priority": "P1",
+                "confidence": 0.85,
+                "privacy_level": "low",
+                "privacy_risk": 0.05,
+                "rationale": "任务缺截止时间(ddl)。",
+            }
+        ],
+        "detection_notes": "",
+        "safety_flags": [],
+    }
+    opportunity_detector = OpportunityDetector(
+        model_client=FakeModelClient(response),
+        settings=ModelGatewaySettings(default_model="gpt-test", fast_model="gpt-fast-test"),
+    )
+    detector = PromptOpportunityDetector(
+        max_opportunities=5,
+        opportunity_detector=opportunity_detector,
+    )
+
+    session_service = SessionService(InMemorySessionStore())
+    session_service.create_session(SessionConfig(title="ddl demo"), session_id="session_001")
+    session_service.append_transcript(
+        "session_001",
+        TranscriptSegmentInput(
+            speaker="小张",
+            start_ms=0,
+            end_ms=1000,
+            text="小张把项目文档给我吧，ddl你定一下。",
+            asr_confidence=0.92,
+        ),
+        segment_id="seg_0",
+    )
+    snapshot = session_service.get_context_snapshot("session_001")
+
+    result = detector.detect(snapshot)
+
+    gap_opps = [
+        o for o in result.opportunities
+        if str(o.prompt_category) == PromptCategory.SUMMARY_GAP_CHECK.value
+    ]
+    assert len(gap_opps) == 1
+    opp = gap_opps[0]
+    assert opp.metadata["detection_source"] == "llm_opportunity_detector"
+    assert opp.metadata["gap_type"] == "action_missing_deadline"
+    assert opp.metadata["owner"] == "小张"
+    assert opp.metadata["entity"] == "项目文档"
+    assert opp.target_speaker_id == "小张"

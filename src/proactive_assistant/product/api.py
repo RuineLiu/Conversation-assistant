@@ -42,7 +42,7 @@ from proactive_assistant.model_gateway import (
     OpenAIChatCompletionsClient,
     OpenAIResponsesClient,
 )
-from proactive_assistant.detection import PromptOpportunityDetector, UnknownTermDetector
+from proactive_assistant.detection import OpportunityDetector, PromptOpportunityDetector, UnknownTermDetector
 from proactive_assistant.detection.vocabulary import PersonalVocabularyService
 from proactive_assistant.orchestration import PromptOrchestrator
 from proactive_assistant.product.contracts import (
@@ -665,13 +665,14 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                     stop_event.set()
                     break
 
+        final_drain_timeout = _stream_final_drain_timeout_seconds()
         receiver = asyncio.create_task(receive_audio())
         sender = asyncio.create_task(send_events())
         try:
             await asyncio.wait({receiver, sender}, return_when=asyncio.FIRST_COMPLETED)
             if receiver.done() and not sender.done():
                 try:
-                    await asyncio.wait_for(sender, timeout=5.0)
+                    await asyncio.wait_for(sender, timeout=final_drain_timeout)
                 except TimeoutError:
                     stop_event.set()
             else:
@@ -1113,37 +1114,56 @@ def _build_opportunity_detector(
     settings: ModelGatewaySettings | None,
     memory_service: MemoryService | None,
 ) -> PromptOpportunityDetector:
-    """Assemble the realtime opportunity detector with optional LLM unknown-term arm.
+    """Assemble the realtime opportunity detector with optional LLM arms.
 
-    Controlled by ``PROACTIVE_UNKNOWN_TERM_DETECTOR`` env var:
+    Two independent LLM arms layer on top of the always-present rule path:
 
-    - ``on`` (default): LLM unknown-term detection is enabled. A
-      ``PersonalVocabularyService`` is wired in when a memory service is
-      available; otherwise the detector still runs without personalization.
-    - ``off``: rule-based detection only; the LLM arm and vocabulary
-      service are not constructed.
+    - ``PROACTIVE_UNKNOWN_TERM_DETECTOR`` (default ``on``): unfamiliar-term
+      detection + a ``PersonalVocabularyService`` when a memory service is
+      available.
+    - ``PROACTIVE_OPPORTUNITY_DETECTOR`` (default ``on``): semantic
+      gap/question/suggestion detection that catches phrasings the keyword
+      tables miss (e.g. "ddl" vs "deadline").
 
-    The detector falls back to ``off`` semantics when no model client is
-    available (e.g. tests calling this helper directly without settings).
+    Each arm falls back to ``off`` semantics when its env var disables it
+    or when no model client is available (e.g. tests calling this helper
+    directly without settings).
     """
 
-    raw = os.getenv("PROACTIVE_UNKNOWN_TERM_DETECTOR", "on").strip().lower()
-    enabled = raw in {"on", "true", "1", "enable", "enabled", "auto"}
-    if not enabled or model_client is None:
+    if model_client is None:
         return PromptOpportunityDetector()
-    unknown_term_detector = UnknownTermDetector(
-        model_client=model_client,
-        settings=_settings_with_default_fast_model(settings),
-    )
-    vocabulary_service = (
-        PersonalVocabularyService(memory_service)
-        if memory_service is not None
-        else None
-    )
+    resolved_settings = _settings_with_default_fast_model(settings)
+
+    unknown_term_detector = None
+    vocabulary_service = None
+    if _env_flag_enabled("PROACTIVE_UNKNOWN_TERM_DETECTOR"):
+        unknown_term_detector = UnknownTermDetector(
+            model_client=model_client,
+            settings=resolved_settings,
+        )
+        vocabulary_service = (
+            PersonalVocabularyService(memory_service)
+            if memory_service is not None
+            else None
+        )
+
+    opportunity_detector = None
+    if _env_flag_enabled("PROACTIVE_OPPORTUNITY_DETECTOR"):
+        opportunity_detector = OpportunityDetector(
+            model_client=model_client,
+            settings=resolved_settings,
+        )
+
     return PromptOpportunityDetector(
         unknown_term_detector=unknown_term_detector,
         vocabulary_service=vocabulary_service,
+        opportunity_detector=opportunity_detector,
     )
+
+
+def _env_flag_enabled(name: str, *, default: str = "on") -> bool:
+    raw = os.getenv(name, default).strip().lower()
+    return raw in {"on", "true", "1", "enable", "enabled", "auto"}
 
 
 def _build_query_understanding_service(
@@ -1244,6 +1264,15 @@ def _stream_control_type(text: str) -> str:
     if not isinstance(payload, dict):
         return ""
     return str(payload.get("type", "")).strip().lower()
+
+
+def _stream_final_drain_timeout_seconds() -> float:
+    raw = os.getenv("PROACTIVE_ASR_STREAM_FINAL_TIMEOUT_SECONDS", "15")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 15.0
+    return max(1.0, value)
 
 
 def _streaming_event_payload(event: StreamingSpeechEvent) -> dict[str, Any]:

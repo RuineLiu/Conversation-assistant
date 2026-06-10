@@ -18,6 +18,13 @@ from proactive_assistant.detection.rules import (
     priority_rank,
     to_rule_match,
 )
+from proactive_assistant.detection.opportunity_detector import (
+    PROMPT_CATEGORY_BY_OPPORTUNITY,
+    OpportunityCandidate,
+    OpportunityDetectionRequest,
+    OpportunityDetector,
+    OpportunityGapType,
+)
 from proactive_assistant.detection.unknown_term_detector import (
     UnknownTermCandidate,
     UnknownTermDetectionRequest,
@@ -48,12 +55,14 @@ class PromptOpportunityDetector:
         max_opportunities: int = 3,
         unknown_term_detector: UnknownTermDetector | None = None,
         vocabulary_service: PersonalVocabularyService | None = None,
+        opportunity_detector: OpportunityDetector | None = None,
     ) -> None:
         if max_opportunities <= 0:
             raise ValueError("max_opportunities must be positive")
         self.max_opportunities = max_opportunities
         self._unknown_term_detector = unknown_term_detector
         self._vocabulary_service = vocabulary_service
+        self._opportunity_detector = opportunity_detector
 
     def detect(self, snapshot: SessionContextSnapshot) -> PromptOpportunityResult:
         opportunities: list[PromptOpportunity] = []
@@ -65,6 +74,12 @@ class PromptOpportunityDetector:
         # at once and produces ready-to-display CONCEPT_EXPLANATION
         # opportunities. Failures here never break the realtime path.
         opportunities.extend(self._detect_unknown_terms(snapshot))
+
+        # LLM-based opportunity detection catches gaps/questions/suggestions
+        # that the keyword tables miss (e.g. "ddl" not matching "deadline").
+        # Runs alongside the rule path; dedup merges overlap. Failures never
+        # break the realtime path.
+        opportunities.extend(self._detect_llm_opportunities(snapshot))
 
         deduped = _dedupe_opportunities(opportunities)
         ordered = sorted(
@@ -118,6 +133,30 @@ class PromptOpportunityDetector:
         opportunities: list[PromptOpportunity] = []
         for candidate in result.candidates:
             opportunities.append(_opportunity_from_unknown_term(snapshot, candidate))
+        return opportunities
+
+    def _detect_llm_opportunities(self, snapshot: SessionContextSnapshot) -> list[PromptOpportunity]:
+        if self._opportunity_detector is None:
+            return []
+        segments = snapshot.recent_transcript.segments
+        if not segments:
+            return []
+        window = [_to_window_item(segment) for segment in segments]
+        try:
+            result = self._opportunity_detector.detect(
+                OpportunityDetectionRequest(
+                    session_id=snapshot.session_id,
+                    locale=snapshot.locale,
+                    transcript_window=window,
+                    privacy_constraints=list(snapshot.privacy_constraints),
+                )
+            )
+        except (ModelGatewayError, ModelOutputValidationError):
+            return []
+
+        opportunities: list[PromptOpportunity] = []
+        for candidate in result.candidates:
+            opportunities.append(_opportunity_from_llm_candidate(snapshot, candidate))
         return opportunities
 
     def _detect_segment(
@@ -216,6 +255,70 @@ def _opportunity_from_unknown_term(
             "unknown_term_candidate_id": candidate.candidate_id,
             "detection_source": "llm_unknown_term_detector",
         },
+    )
+
+
+def _opportunity_from_llm_candidate(
+    snapshot: SessionContextSnapshot,
+    candidate: OpportunityCandidate,
+) -> PromptOpportunity:
+    category = PROMPT_CATEGORY_BY_OPPORTUNITY[str(candidate.prompt_category)]
+    gap_type_value = str(candidate.gap_type)
+    speaker = _speaker_for_segment(snapshot, candidate.source_segment_id)
+    opportunity_id = _opportunity_id(
+        snapshot.session_id,
+        candidate.source_segment_id,
+        category.value,
+        candidate.candidate_id,
+    )
+    # Gap checks read better as concise bullets; everything else is a
+    # one-line answer. The enforcer still caps glasses length downstream.
+    granularity = (
+        ContentGranularity.CONCISE_BULLETS
+        if category == PromptCategory.SUMMARY_GAP_CHECK
+        else ContentGranularity.ONE_LINE_ANSWER
+    )
+    metadata: dict[str, object] = {
+        "speaker": speaker,
+        "detection_source": "llm_opportunity_detector",
+        "llm_opportunity_candidate_id": candidate.candidate_id,
+        "llm_opportunity_rationale": candidate.rationale,
+    }
+    if gap_type_value and gap_type_value != OpportunityGapType.NONE.value:
+        metadata["gap_type"] = gap_type_value
+    if candidate.owner:
+        metadata["owner"] = candidate.owner
+        metadata["assignee"] = candidate.owner
+    if candidate.deadline:
+        metadata["deadline"] = candidate.deadline
+    if candidate.entity:
+        metadata["entity"] = candidate.entity
+        metadata["canonical_entity"] = candidate.entity
+    return PromptOpportunity(
+        opportunity_id=opportunity_id,
+        session_id=snapshot.session_id,
+        trigger_segment_ids=[candidate.source_segment_id],
+        captured_text=candidate.captured_text,
+        prompt_category=category,
+        activity_phase=ActivityPhase.IN_ACTIVITY,
+        candidate_timing_action=CandidateTimingAction.DURING_ACTIVITY,
+        suggested_content_granularity=granularity,
+        priority=PromptPriority(str(candidate.priority)),
+        confidence=candidate.confidence,
+        privacy_level=candidate.privacy_level,
+        privacy_risk=candidate.privacy_risk,
+        reason=candidate.rationale or f"LLM detected {category.value} opportunity.",
+        safety_flags=[],
+        rule_matches=[
+            DetectionRuleMatch(
+                rule_name="llm_opportunity_detector",
+                matched_terms=[gap_type_value] if gap_type_value != OpportunityGapType.NONE.value else [],
+                confidence_delta=0.0,
+                reason=candidate.rationale or "LLM opportunity detector.",
+            )
+        ],
+        target_speaker_id=speaker or "",
+        metadata=metadata,
     )
 
 
