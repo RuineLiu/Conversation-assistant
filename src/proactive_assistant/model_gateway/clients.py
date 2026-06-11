@@ -175,12 +175,19 @@ class OpenAIChatCompletionsClient:
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         client = self._client or self._build_client()
         started = time.perf_counter()
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": request.instructions},
+        ]
+        # Endpoints that only support json_object (or no response_format) do
+        # not natively enforce the JSON schema, so the model is free to
+        # invent enum values and drop required fields. Inline the schema as
+        # explicit guidance so non-strict endpoints still honor the contract.
+        if self._response_format != "json_schema":
+            messages.append({"role": "system", "content": _schema_guidance_message(request)})
+        messages.append({"role": "user", "content": request.input_text})
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "messages": [
-                {"role": "system", "content": request.instructions},
-                {"role": "user", "content": request.input_text},
-            ],
+            "messages": messages,
         }
         response_format = _chat_response_format(request, self._response_format)
         if response_format is not None:
@@ -355,6 +362,23 @@ def _message_field_names(message: Any) -> set[str]:
     if isinstance(model_extra, dict):
         fields.update(str(key) for key in model_extra)
     return fields
+
+
+def _schema_guidance_message(request: ModelRequest) -> str:
+    """Inline JSON-schema guidance for endpoints lacking strict enforcement.
+
+    Compact but explicit: the model must use only allowed enum values and
+    include every required field. Mirrors what strict json_schema mode would
+    enforce natively on OpenAI's first-party API.
+    """
+
+    schema_json = json.dumps(request.response_schema, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "You must return ONLY a single JSON object that strictly conforms to the "
+        "following JSON Schema. Use only the allowed enum values. Include every "
+        "property listed under \"required\". Do not add properties that are not in "
+        f"the schema.\n\nJSON Schema for \"{request.response_schema_name}\":\n{schema_json}"
+    )
 
 
 def _chat_response_format(request: ModelRequest, mode: str) -> dict[str, Any] | None:

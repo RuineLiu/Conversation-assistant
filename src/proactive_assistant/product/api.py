@@ -99,6 +99,27 @@ from proactive_assistant.sessions import (
 from proactive_assistant.sessions.store import SessionAlreadyExistsError, SessionNotFoundError
 
 
+def _load_env_file_into_environ() -> None:
+    """Populate ``os.environ`` from the project ``.env`` so plain
+    ``os.getenv`` config (ASR_PROVIDER, PROACTIVE_PROMPT_MODE, ...) sees
+    the same values pydantic ``BaseSettings`` already reads from ``.env``.
+
+    Without this, ``uv run uvicorn`` leaves ``.env`` values out of the
+    process environment, so the provider/feature toggles silently fall
+    back to their defaults (e.g. ASR_PROVIDER -> "azure"). Real environment
+    variables take precedence (``override=False``).
+    """
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(override=False)
+
+
+_load_env_file_into_environ()
+
+
 class HealthResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
