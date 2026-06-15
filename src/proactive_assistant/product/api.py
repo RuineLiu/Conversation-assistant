@@ -1107,6 +1107,8 @@ def _build_prompt_orchestrator(
     glasses_timeout = (
         settings.glasses_prompt_timeout_seconds if settings is not None else None
     )
+    generation_model = _prompt_generation_model(settings)
+    public_knowledge_model = _public_knowledge_model()
     if mode in {"rules", "rule", "rule_based", "rule-based"}:
         return PromptOrchestrator(
             prompt_service=rule_service,
@@ -1119,6 +1121,8 @@ def _build_prompt_orchestrator(
             fallback_on_generation_failure=False,
             detector=detector,
             glasses_prompt_timeout_seconds=glasses_timeout,
+            generation_model=generation_model,
+            public_knowledge_model=public_knowledge_model,
         )
     if mode in {"llm_with_rule_fallback", "llm_with_rules", "fallback"}:
         return PromptOrchestrator(
@@ -1127,8 +1131,31 @@ def _build_prompt_orchestrator(
             fallback_on_generation_failure=True,
             detector=detector,
             glasses_prompt_timeout_seconds=glasses_timeout,
+            generation_model=generation_model,
+            public_knowledge_model=public_knowledge_model,
         )
     raise ValueError(f"unsupported prompt mode: {mode}")
+
+
+def _prompt_generation_model(settings: ModelGatewaySettings | None) -> str | None:
+    """A3: optional model override for prompt generation.
+
+    - ``PROACTIVE_PROMPT_GENERATION_MODEL=<name>`` -> use that model.
+    - ``PROACTIVE_PROMPT_GENERATION_FAST=on`` -> use the configured fast model.
+    - unset -> None (gateway default model, preserving quality).
+    """
+
+    explicit = os.getenv("PROACTIVE_PROMPT_GENERATION_MODEL", "").strip()
+    if explicit:
+        return explicit
+    if _env_flag_enabled("PROACTIVE_PROMPT_GENERATION_FAST", default="off") and settings is not None:
+        return settings.fast_model
+    return None
+
+
+def _public_knowledge_model() -> str | None:
+    explicit = os.getenv("PROACTIVE_PUBLIC_KNOWLEDGE_MODEL", "").strip()
+    return explicit or None
 
 
 def _build_opportunity_detector(
@@ -1253,6 +1280,7 @@ def _build_model_client(settings: ModelGatewaySettings) -> OpenAIResponsesClient
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
             timeout_seconds=settings.request_timeout_seconds,
+            max_retries=settings.request_max_retries,
         )
     if settings.model_api_style == "chat_completions":
         return OpenAIChatCompletionsClient(
@@ -1261,6 +1289,7 @@ def _build_model_client(settings: ModelGatewaySettings) -> OpenAIResponsesClient
             timeout_seconds=settings.request_timeout_seconds,
             response_format=settings.chat_response_format,
             max_tokens_param=settings.chat_max_tokens_param,
+            max_retries=settings.request_max_retries,
         )
     raise ValueError(f"unsupported model API style: {settings.model_api_style}")
 

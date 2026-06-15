@@ -6,6 +6,7 @@ from proactive_assistant.model_gateway import FakeModelClient, ModelOutputValida
 from proactive_assistant.model_gateway.settings import ModelGatewaySettings
 from proactive_assistant.prompting import (
     GlassesLengthLimits,
+    PromptCategory,
     PromptGenerationRequest,
     PromptGenerationService,
     TranscriptWindowItem,
@@ -130,6 +131,57 @@ def test_prompt_generation_service_inferrs_should_prompt_from_content() -> None:
 
     assert result.should_prompt is True
     assert result.glasses_title == "待确认"
+
+
+def test_prompt_generation_service_accepts_should_show_alias() -> None:
+    client = FakeModelClient(
+        {
+            "should_show": True,
+            "prompt_category": "question_answer",
+            "content_granularity": 2,
+            "glasses_title": "导演",
+            "glasses_text": "《桃色公寓》导演是比利·怀尔德。",
+            "source_refs": ["transcript_001"],
+        },
+        latency_ms=3,
+    )
+    service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+
+    result = service.generate_prompt(make_prompt_request())
+
+    assert result.should_prompt is True
+    assert result.glasses_text == "《桃色公寓》导演是比利·怀尔德。"
+    assert result.source_refs == ["transcript:transcript_001"]
+    assert result.confidence == 0.7
+
+
+def test_prompt_generation_service_fills_category_and_source_refs_from_request() -> None:
+    client = FakeModelClient(
+        {
+            "content_granularity": 2,
+            "glasses_title": "导演",
+            "glasses_text": "《桃色公寓》导演是比利·怀尔德。",
+            "source_refs": [],
+            "privacy_level": "low",
+        },
+        latency_ms=3,
+    )
+    service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    request = make_prompt_request().model_copy(
+        update={"prompt_category_candidate": PromptCategory.QUESTION_ANSWER}
+    )
+
+    result = service.generate_prompt(request)
+
+    assert result.should_prompt is True
+    assert result.prompt_category == PromptCategory.QUESTION_ANSWER
+    assert result.source_refs == ["transcript:transcript_001"]
 
 
 def test_prompt_generation_service_rejects_invalid_model_output() -> None:

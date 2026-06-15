@@ -228,3 +228,27 @@ def test_warmup_memory_distinguishes_cold_start_from_no_query_match() -> None:
     # Records exist for this user (so not cold start), but the Atlas
     # query did not match the unrelated preference record.
     assert warmup.is_empty_cold_start is False
+
+
+def test_append_transcript_caps_prompts_to_one_by_default() -> None:
+    """A4: realtime path generates a single glasses prompt even when the
+    detector surfaces multiple opportunities."""
+    service = _build_service()
+    service.create_session(
+        SessionConfig(title="x", metadata={"org_id": "org_001", "subject_user_id": "user_001"}),
+        session_id="session_001",
+    )
+
+    step = service.append_transcript_and_generate_prompts(
+        "session_001",
+        TranscriptSegmentInput(
+            speaker="张三",
+            start_ms=0,
+            end_ms=1500,
+            text="这个数据为什么变化？另外这个风险下一步谁来推进，下周五能定吗？",
+            asr_confidence=0.94,
+        ),
+        segment_id="seg_0",
+    )
+
+    assert len(step.prompts) <= 1

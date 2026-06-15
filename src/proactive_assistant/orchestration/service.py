@@ -48,6 +48,8 @@ class PromptOrchestrator:
         enforcer: PromptResultEnforcer | None = None,
         rate_limiter: RateLimiter | None = None,
         glasses_prompt_timeout_seconds: float | None = None,
+        generation_model: str | None = None,
+        public_knowledge_model: str | None = None,
     ) -> None:
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
@@ -58,6 +60,14 @@ class PromptOrchestrator:
         self._max_candidates = max_candidates
         self._enforcer = enforcer if enforcer is not None else PromptResultEnforcer()
         self._rate_limiter = rate_limiter if rate_limiter is not None else RateLimiter()
+        # A3: optional override of the model used for prompt generation. None
+        # uses the gateway's default model. Set to a fast model to trade some
+        # quality for lower per-prompt latency.
+        self._generation_model = generation_model
+        # Public factual questions ("who directed this film?") need better
+        # factual reliability than the realtime fast model. Keep this route
+        # narrow so ordinary business prompts stay low-latency.
+        self._public_knowledge_model = public_knowledge_model
         # When set, glasses-bound prompt generations get a hard deadline so
         # the wearable never displays a popup that arrived too late. None
         # disables this and uses the model gateway's own request timeout.
@@ -172,9 +182,9 @@ class PromptOrchestrator:
     ) -> PromptGenerationResult:
         deadline = self._glasses_prompt_timeout_seconds
         if deadline is None or deadline <= 0 or not _is_glasses_surface(prompt_request.prd_surface):
-            return self._prompt_service.generate_prompt(prompt_request)
+            return self._generate_prompt(prompt_request)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._prompt_service.generate_prompt, prompt_request)
+            future = executor.submit(self._generate_prompt, prompt_request)
             try:
                 return future.result(timeout=deadline)
             except concurrent.futures.TimeoutError as exc:
@@ -182,6 +192,17 @@ class PromptOrchestrator:
                 raise ModelGatewayTimeoutError(
                     f"glasses prompt generation exceeded {deadline:.2f}s deadline"
                 ) from exc
+
+    def _generate_prompt(self, prompt_request: PromptGenerationRequest) -> PromptGenerationResult:
+        model = self._model_for_prompt_request(prompt_request)
+        if model is not None:
+            return self._prompt_service.generate_prompt(prompt_request, model=model)
+        return self._prompt_service.generate_prompt(prompt_request)
+
+    def _model_for_prompt_request(self, prompt_request: PromptGenerationRequest) -> str | None:
+        if self._public_knowledge_model is not None and _is_public_knowledge_request(prompt_request):
+            return self._public_knowledge_model
+        return self._generation_model
 
     def _build_timeout_candidate(
         self,
@@ -501,6 +522,73 @@ def _enum_value(value: Any) -> Any:
 def _is_glasses_surface(surface: Any) -> bool:
     value = surface.value if hasattr(surface, "value") else str(surface)
     return value in GLASSES_SURFACES
+
+
+PUBLIC_KNOWLEDGE_TERMS = (
+    "导演",
+    "编剧",
+    "作者",
+    "主演",
+    "演员",
+    "电影",
+    "影片",
+    "电视剧",
+    "小说",
+    "书",
+    "专辑",
+    "歌曲",
+    "歌手",
+    "哪一年",
+    "谁写",
+    "谁导",
+    "谁演",
+    "创始人",
+    "成立于",
+    "director",
+    "author",
+    "writer",
+    "actor",
+    "movie",
+    "film",
+    "novel",
+    "founded",
+    "founder",
+)
+
+BUSINESS_PRIVATE_TERMS = (
+    "负责人",
+    "谁负责",
+    "跟进",
+    "截止",
+    "deadline",
+    "ddl",
+    "客户",
+    "报价",
+    "合同",
+    "项目",
+    "会议",
+    "风险",
+    "下一步",
+    "owner",
+    "action item",
+    "todo",
+)
+
+
+def _is_public_knowledge_request(request: PromptGenerationRequest) -> bool:
+    category = str(_enum_value(request.prompt_category_candidate))
+    if category not in {"question_answer", "concept_explanation", "person_or_fact"}:
+        return False
+    text_parts = [item.text for item in request.transcript_window]
+    opportunity = request.session_context.get("opportunity")
+    if isinstance(opportunity, dict):
+        captured_text = opportunity.get("captured_text")
+        if isinstance(captured_text, str):
+            text_parts.append(captured_text)
+    text = " ".join(text_parts).lower()
+    if any(term.lower() in text for term in BUSINESS_PRIVATE_TERMS):
+        return False
+    return any(term.lower() in text for term in PUBLIC_KNOWLEDGE_TERMS)
 
 
 def _request_with_surface(

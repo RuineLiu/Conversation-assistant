@@ -66,11 +66,13 @@ class OpenAIResponsesClient:
         base_url: str | None = None,
         timeout_seconds: float = 30.0,
         client: Any | None = None,
+        max_retries: int = 2,
     ) -> None:
         self._client = client
         self._api_key = api_key
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
 
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         client = self._client or self._build_client()
@@ -133,7 +135,7 @@ class OpenAIResponsesClient:
         except ImportError as exc:  # pragma: no cover - dependency is installed in normal envs
             raise ModelGatewayError("openai package is not installed") from exc
 
-        kwargs: dict[str, Any] = {"timeout": self._timeout_seconds}
+        kwargs: dict[str, Any] = {"timeout": self._timeout_seconds, "max_retries": self._max_retries}
         if self._base_url is not None:
             kwargs["base_url"] = self._base_url
         if self._api_key is not None:
@@ -163,6 +165,7 @@ class OpenAIChatCompletionsClient:
         response_format: str = "json_schema",
         max_tokens_param: str = "max_tokens",
         provider: str = "openai_compatible_chat",
+        max_retries: int = 2,
     ) -> None:
         self._client = client
         self._api_key = api_key
@@ -171,6 +174,10 @@ class OpenAIChatCompletionsClient:
         self._response_format = response_format
         self._max_tokens_param = max_tokens_param
         self._provider = provider
+        # SDK default is 2 retries; each retry multiplies latency on a flaky
+        # endpoint (503/timeout). For a realtime assistant prefer to fail fast
+        # and fall back to rules rather than stall the wearable.
+        self._max_retries = max_retries
 
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         client = self._client or self._build_client()
@@ -220,7 +227,7 @@ class OpenAIChatCompletionsClient:
         except ImportError as exc:  # pragma: no cover - dependency is installed in normal envs
             raise ModelGatewayError("openai package is not installed") from exc
 
-        kwargs: dict[str, Any] = {"timeout": self._timeout_seconds}
+        kwargs: dict[str, Any] = {"timeout": self._timeout_seconds, "max_retries": self._max_retries}
         if self._base_url is not None:
             kwargs["base_url"] = self._base_url
         if self._api_key is not None:

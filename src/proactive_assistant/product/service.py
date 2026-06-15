@@ -279,6 +279,7 @@ class ProductAssistantService:
         memory_limit: int = 8,
         include_pending_memory: bool = False,
         policy_version: str = "product_flow_v0",
+        max_prompts: int = 1,
     ) -> ProductTranscriptStepResult:
         transcript_segment = self.sessions.append_transcript(session_id, segment, segment_id=segment_id)
         meeting_update = self.meeting_state_tracker.update_from_segment(
@@ -335,6 +336,11 @@ class ProductAssistantService:
             snapshot,
             extra_opportunities=state_opportunities,
         )
+        # A4: glasses shows a single prompt. Generate only the top-ranked
+        # opportunity (already sorted by priority/category/confidence) so the
+        # realtime path makes one generation call instead of up to N.
+        if max_prompts > 0:
+            opportunities = opportunities[:max_prompts]
         orchestration_result = self._run_memory_aware_orchestration(
             session_id,
             base_snapshot=snapshot,

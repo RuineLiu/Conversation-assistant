@@ -482,3 +482,85 @@ def test_orchestrator_fast_paths_pre_generated_explanation_without_second_llm_ca
     assert candidate.prompt_result.model_usage.provider == "unknown_term_detector"
     assert candidate.metadata["stage"] == "prompt_generation_fast_path"
     assert candidate.metadata["fast_path_source"] == "llm_unknown_term_detector"
+
+
+def test_orchestrator_uses_generation_model_override_when_set() -> None:
+    """A3: when generation_model is set, prompt generation requests use it
+    instead of the gateway default."""
+    response_for_request = lambda request: valid_prompt_response(source_refs=["transcript:seg_0"])  # noqa: E731
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-default"),
+    )
+    orchestrator = PromptOrchestrator(
+        prompt_service=prompt_service,
+        generation_model="gpt-fast-override",
+    )
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    orchestrator.run(snapshot)
+
+    assert client.requests, "expected a generation request"
+    assert client.requests[0].model == "gpt-fast-override"
+
+
+def test_orchestrator_uses_default_model_when_no_override() -> None:
+    response_for_request = lambda request: valid_prompt_response(source_refs=["transcript:seg_0"])  # noqa: E731
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-default"),
+    )
+    orchestrator = PromptOrchestrator(prompt_service=prompt_service)
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    orchestrator.run(snapshot)
+
+    assert client.requests
+    assert client.requests[0].model == "gpt-default"
+
+
+def test_orchestrator_routes_public_knowledge_question_to_public_model() -> None:
+    response_for_request = lambda request: valid_prompt_response(  # noqa: E731
+        prompt_category="question_answer",
+        glasses_title="导演",
+        glasses_text="《桃色公寓》导演是比利·怀尔德。",
+        source_refs=["transcript:seg_0"],
+    )
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-default"),
+    )
+    orchestrator = PromptOrchestrator(
+        prompt_service=prompt_service,
+        generation_model="gpt-fast",
+        public_knowledge_model="gpt-factual",
+    )
+    snapshot = make_snapshot("桃色公寓的导演是谁？")
+
+    orchestrator.run(snapshot)
+
+    assert client.requests
+    assert client.requests[0].model == "gpt-factual"
+
+
+def test_orchestrator_keeps_business_gap_on_generation_model() -> None:
+    response_for_request = lambda request: valid_prompt_response(source_refs=["transcript:seg_0"])  # noqa: E731
+    client = FakeModelClient(response_for_request)
+    prompt_service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-default"),
+    )
+    orchestrator = PromptOrchestrator(
+        prompt_service=prompt_service,
+        generation_model="gpt-fast",
+        public_knowledge_model="gpt-factual",
+    )
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    orchestrator.run(snapshot)
+
+    assert client.requests
+    assert client.requests[0].model == "gpt-fast"

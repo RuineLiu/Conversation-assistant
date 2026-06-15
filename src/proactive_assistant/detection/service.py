@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from hashlib import sha1
 from typing import TYPE_CHECKING
 
@@ -70,16 +71,13 @@ class PromptOpportunityDetector:
         for segment in segments:
             opportunities.extend(self._detect_segment(snapshot, segment))
 
-        # LLM-based unknown-term detection runs over the whole recent window
-        # at once and produces ready-to-display CONCEPT_EXPLANATION
-        # opportunities. Failures here never break the realtime path.
-        opportunities.extend(self._detect_unknown_terms(snapshot))
-
-        # LLM-based opportunity detection catches gaps/questions/suggestions
-        # that the keyword tables miss (e.g. "ddl" not matching "deadline").
-        # Runs alongside the rule path; dedup merges overlap. Failures never
-        # break the realtime path.
-        opportunities.extend(self._detect_llm_opportunities(snapshot))
+        # A1: the two LLM detector arms are independent network calls, so run
+        # them concurrently instead of serially. Each arm already swallows its
+        # own errors and returns [] on failure, so the futures never raise.
+        # - unknown-term detection -> CONCEPT_EXPLANATION opportunities
+        # - opportunity detection  -> gap/question/suggestion opportunities the
+        #   keyword tables miss (e.g. "ddl" not matching "deadline")
+        opportunities.extend(self._detect_llm_arms_concurrently(snapshot))
 
         deduped = _dedupe_opportunities(opportunities)
         ordered = sorted(
@@ -96,6 +94,29 @@ class PromptOpportunityDetector:
             opportunities=ordered,
             inspected_segment_ids=[segment.segment_id for segment in segments],
         )
+
+    def _detect_llm_arms_concurrently(self, snapshot: SessionContextSnapshot) -> list[PromptOpportunity]:
+        """Run the unknown-term and opportunity LLM arms in parallel.
+
+        Falls back to sequential execution when only one arm is configured
+        (no thread-pool overhead for a single call).
+        """
+
+        arms = []
+        if self._unknown_term_detector is not None:
+            arms.append(self._detect_unknown_terms)
+        if self._opportunity_detector is not None:
+            arms.append(self._detect_llm_opportunities)
+        if not arms:
+            return []
+        if len(arms) == 1:
+            return arms[0](snapshot)
+        results: list[PromptOpportunity] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as executor:
+            futures = [executor.submit(arm, snapshot) for arm in arms]
+            for future in futures:
+                results.extend(future.result())
+        return results
 
     def _detect_unknown_terms(self, snapshot: SessionContextSnapshot) -> list[PromptOpportunity]:
         if self._unknown_term_detector is None:

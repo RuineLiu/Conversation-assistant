@@ -50,6 +50,14 @@ class ModelGatewaySettings(BaseSettings):
             "PROACTIVE_OPENAI_REQUEST_TIMEOUT_SECONDS",
         ),
     )
+    request_max_retries: int = Field(
+        default=1,
+        ge=0,
+        validation_alias=AliasChoices(
+            "OPENAI_MAX_RETRIES",
+            "PROACTIVE_OPENAI_MAX_RETRIES",
+        ),
+    )
     glasses_prompt_timeout_seconds: float = Field(
         default=5.0,
         gt=0,
