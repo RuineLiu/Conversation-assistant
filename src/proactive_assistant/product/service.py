@@ -669,6 +669,7 @@ class ProductAssistantService:
         snapshot_for_result = base_snapshot
         max_segments = max(len(base_snapshot.recent_transcript.segments), 1)
         for opportunity in opportunities:
+            should_search_memory = use_memory and _opportunity_needs_realtime_memory(opportunity)
             opportunity_memory = (
                 self.search_memory_context_for_session(
                     session_id,
@@ -679,7 +680,7 @@ class ProductAssistantService:
                     activity_phase=str(_enum_value(opportunity.activity_phase)),
                     prd_surface=_prd_surface_for_opportunity(opportunity),
                 )
-                if use_memory
+                if should_search_memory
                 else None
             )
             memory_context = _merge_unique(
@@ -713,6 +714,7 @@ class ProductAssistantService:
                         "memory_query_text": opportunity.captured_text,
                         "memory_query_prompt_category": str(_enum_value(opportunity.prompt_category)),
                         "memory_query_activity_phase": str(_enum_value(opportunity.activity_phase)),
+                        "memory_lookup_skipped": use_memory and not should_search_memory,
                     }
                 }
             )
@@ -1519,6 +1521,62 @@ def _clean_active_entity(entity: dict[str, Any]) -> dict[str, Any]:
         **entity,
         "aliases": [str(alias) for alias in aliases if alias],
     }
+
+
+PUBLIC_KNOWLEDGE_MEMORY_SKIP_TERMS = (
+    "导演",
+    "编剧",
+    "作者",
+    "主演",
+    "演员",
+    "电影",
+    "影片",
+    "小说",
+    "歌曲",
+    "歌手",
+    "director",
+    "author",
+    "writer",
+    "actor",
+    "movie",
+    "film",
+    "novel",
+)
+
+PRIVATE_MEMORY_TERMS = (
+    "会议",
+    "项目",
+    "客户",
+    "负责人",
+    "谁负责",
+    "跟进",
+    "截止",
+    "deadline",
+    "ddl",
+    "合同",
+    "报价",
+    "风险",
+    "待办",
+    "下一步",
+    "meeting",
+    "project",
+    "customer",
+    "owner",
+    "todo",
+    "action item",
+)
+
+
+def _opportunity_needs_realtime_memory(opportunity: Any) -> bool:
+    category = str(_enum_value(getattr(opportunity, "prompt_category", "")))
+    text = str(getattr(opportunity, "captured_text", "") or "").lower()
+    if any(term.lower() in text for term in PRIVATE_MEMORY_TERMS):
+        return True
+    if category not in {"question_answer", "concept_explanation", "person_or_fact"}:
+        return False
+    if any(term.lower() in text for term in PUBLIC_KNOWLEDGE_MEMORY_SKIP_TERMS):
+        return False
+    return category == "person_or_fact"
 
 
 def _enum_value(value: Any) -> Any:

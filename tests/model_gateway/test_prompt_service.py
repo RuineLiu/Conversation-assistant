@@ -184,6 +184,42 @@ def test_prompt_generation_service_fills_category_and_source_refs_from_request()
     assert result.source_refs == ["transcript:transcript_001"]
 
 
+def test_prompt_generation_service_wraps_public_knowledge_text_response() -> None:
+    client = FakeModelClient(
+        {},
+        text_response="《桃色公寓》导演是比利·怀尔德。",
+        latency_ms=3,
+    )
+    service = PromptGenerationService(
+        model_client=client,
+        settings=ModelGatewaySettings(default_model="gpt-test"),
+    )
+    request = make_prompt_request().model_copy(
+        update={
+            "prompt_category_candidate": PromptCategory.QUESTION_ANSWER,
+            "transcript_window": [
+                TranscriptWindowItem(
+                    transcript_id="seg_0",
+                    speaker="Bao",
+                    text="桃色公寓的导演是谁？",
+                )
+            ],
+        }
+    )
+
+    result = service.generate_public_knowledge_prompt(request, model="gpt-factual")
+
+    assert result.should_prompt is True
+    assert result.prompt_category == PromptCategory.QUESTION_ANSWER
+    assert result.glasses_title == "导演"
+    assert result.glasses_text == "《桃色公寓》导演是比利·怀尔德。"
+    assert result.source_refs == ["transcript:seg_0"]
+    assert result.model_usage is not None
+    assert result.model_usage.model == "gpt-factual"
+    assert client.text_requests[0].model == "gpt-factual"
+    assert client.requests == []
+
+
 def test_prompt_generation_service_rejects_invalid_model_output() -> None:
     client = FakeModelClient(
         {

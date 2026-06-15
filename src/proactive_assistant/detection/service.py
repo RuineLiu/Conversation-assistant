@@ -57,6 +57,7 @@ class PromptOpportunityDetector:
         unknown_term_detector: UnknownTermDetector | None = None,
         vocabulary_service: PersonalVocabularyService | None = None,
         opportunity_detector: OpportunityDetector | None = None,
+        rule_first_detection: bool = False,
     ) -> None:
         if max_opportunities <= 0:
             raise ValueError("max_opportunities must be positive")
@@ -64,12 +65,17 @@ class PromptOpportunityDetector:
         self._unknown_term_detector = unknown_term_detector
         self._vocabulary_service = vocabulary_service
         self._opportunity_detector = opportunity_detector
+        self._rule_first_detection = rule_first_detection
 
     def detect(self, snapshot: SessionContextSnapshot) -> PromptOpportunityResult:
-        opportunities: list[PromptOpportunity] = []
+        rule_opportunities: list[PromptOpportunity] = []
         segments = snapshot.recent_transcript.segments
         for segment in segments:
-            opportunities.extend(self._detect_segment(snapshot, segment))
+            rule_opportunities.extend(self._detect_segment(snapshot, segment))
+
+        opportunities: list[PromptOpportunity] = list(rule_opportunities)
+        if self._rule_first_detection and rule_opportunities:
+            return self._result_from_opportunities(snapshot, segments, opportunities)
 
         # A1: the two LLM detector arms are independent network calls, so run
         # them concurrently instead of serially. Each arm already swallows its
@@ -78,6 +84,14 @@ class PromptOpportunityDetector:
         # - opportunity detection  -> gap/question/suggestion opportunities the
         #   keyword tables miss (e.g. "ddl" not matching "deadline")
         opportunities.extend(self._detect_llm_arms_concurrently(snapshot))
+        return self._result_from_opportunities(snapshot, segments, opportunities)
+
+    def _result_from_opportunities(
+        self,
+        snapshot: SessionContextSnapshot,
+        segments: list[TranscriptSegmentRecord],
+        opportunities: list[PromptOpportunity],
+    ) -> PromptOpportunityResult:
 
         deduped = _dedupe_opportunities(opportunities)
         ordered = sorted(
@@ -217,6 +231,7 @@ class PromptOpportunityDetector:
                     rule_matches=[to_rule_match(adjusted)],
                     target_speaker_id=segment.speaker or "",
                     metadata={
+                        "detection_source": "rules",
                         "speaker": segment.speaker,
                         "start_ms": segment.start_ms,
                         "end_ms": segment.end_ms,

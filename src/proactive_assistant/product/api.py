@@ -1208,6 +1208,7 @@ def _build_opportunity_detector(
         unknown_term_detector=unknown_term_detector,
         vocabulary_service=vocabulary_service,
         opportunity_detector=opportunity_detector,
+        rule_first_detection=_env_flag_enabled("PROACTIVE_RULE_FIRST_DETECTION"),
     )
 
 

@@ -269,3 +269,86 @@ def test_detector_emits_gap_opportunity_from_llm_opportunity_detector() -> None:
     assert opp.metadata["owner"] == "小张"
     assert opp.metadata["entity"] == "项目文档"
     assert opp.target_speaker_id == "小张"
+
+
+def test_rule_first_detection_skips_llm_arms_when_rules_find_opportunity() -> None:
+    from proactive_assistant.detection import OpportunityDetector
+    from proactive_assistant.model_gateway import FakeModelClient
+    from proactive_assistant.model_gateway.settings import ModelGatewaySettings
+
+    client = FakeModelClient(
+        {
+            "opportunities": [
+                {
+                    "prompt_category": "summary_gap_check",
+                    "gap_type": "action_missing_owner",
+                    "captured_text": "should not be used",
+                    "source_segment_id": "seg_0",
+                    "priority": "P1",
+                    "confidence": 0.85,
+                    "privacy_level": "low",
+                    "privacy_risk": 0.05,
+                    "rationale": "should not be called",
+                }
+            ],
+            "detection_notes": "",
+            "safety_flags": [],
+        }
+    )
+    detector = PromptOpportunityDetector(
+        opportunity_detector=OpportunityDetector(
+            model_client=client,
+            settings=ModelGatewaySettings(default_model="gpt-test", fast_model="gpt-fast"),
+        ),
+        rule_first_detection=True,
+    )
+    snapshot = make_snapshot("这个问题谁负责，下周五 deadline 前能不能定？")
+
+    result = detector.detect(snapshot)
+
+    assert result.opportunities
+    assert result.opportunities[0].metadata["detection_source"] == "rules"
+    assert client.requests == []
+
+
+def test_rule_first_detection_still_uses_llm_when_rules_miss() -> None:
+    from proactive_assistant.detection import OpportunityDetector
+    from proactive_assistant.model_gateway import FakeModelClient
+    from proactive_assistant.model_gateway.settings import ModelGatewaySettings
+
+    client = FakeModelClient(
+        {
+            "opportunities": [
+                {
+                    "prompt_category": "summary_gap_check",
+                    "gap_type": "action_missing_deadline",
+                    "captured_text": "小张把项目文档给我，ddl还没定。",
+                    "source_segment_id": "seg_0",
+                    "owner": "小张",
+                    "deadline": "",
+                    "entity": "项目文档",
+                    "priority": "P1",
+                    "confidence": 0.85,
+                    "privacy_level": "low",
+                    "privacy_risk": 0.05,
+                    "rationale": "任务缺截止时间(ddl)。",
+                }
+            ],
+            "detection_notes": "",
+            "safety_flags": [],
+        }
+    )
+    detector = PromptOpportunityDetector(
+        opportunity_detector=OpportunityDetector(
+            model_client=client,
+            settings=ModelGatewaySettings(default_model="gpt-test", fast_model="gpt-fast"),
+        ),
+        rule_first_detection=True,
+    )
+    snapshot = make_snapshot("小张把项目文档给我吧，ddl你定一下。")
+
+    result = detector.detect(snapshot)
+
+    assert result.opportunities
+    assert result.opportunities[0].metadata["detection_source"] == "llm_opportunity_detector"
+    assert len(client.requests) == 1

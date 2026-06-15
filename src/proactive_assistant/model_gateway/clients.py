@@ -51,9 +51,36 @@ class ModelResponse(BaseModel):
     cached: bool = False
 
 
+class TextModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    instructions: str = Field(min_length=1)
+    input_text: str = Field(min_length=1)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class TextModelResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    provider: str
+    model: str
+    latency_ms: int
+    raw_response_id: str | None = None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cached: bool = False
+
+
 class ModelClient(Protocol):
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         """Generate structured JSON according to request.response_schema."""
+
+    def generate_text(self, request: TextModelRequest) -> TextModelResponse:
+        """Generate plain text for low-latency narrow routes."""
 
 
 class OpenAIResponsesClient:
@@ -121,6 +148,41 @@ class OpenAIResponsesClient:
         usage = getattr(response, "usage", None)
         return ModelResponse(
             parsed=parsed,
+            provider="openai",
+            model=request.model,
+            latency_ms=latency_ms,
+            raw_response_id=getattr(response, "id", None),
+            input_tokens=_usage_value(usage, "input_tokens"),
+            output_tokens=_usage_value(usage, "output_tokens"),
+        )
+
+    def generate_text(self, request: TextModelRequest) -> TextModelResponse:
+        client = self._client or self._build_client()
+        started = time.perf_counter()
+        try:
+            response = client.responses.create(
+                model=request.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": request.instructions}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": request.input_text}],
+                    },
+                ],
+                temperature=request.temperature,
+                max_output_tokens=request.max_output_tokens,
+                metadata=request.metadata,
+                timeout=self._timeout_seconds,
+            )
+        except Exception as exc:
+            raise ModelGatewayError(f"OpenAI Responses text request failed: {exc}") from exc
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        usage = getattr(response, "usage", None)
+        return TextModelResponse(
+            text=_parse_response_text(response),
             provider="openai",
             model=request.model,
             latency_ms=latency_ms,
@@ -221,6 +283,36 @@ class OpenAIChatCompletionsClient:
             output_tokens=_usage_first(usage, "output_tokens", "completion_tokens"),
         )
 
+    def generate_text(self, request: TextModelRequest) -> TextModelResponse:
+        client = self._client or self._build_client()
+        started = time.perf_counter()
+        kwargs: dict[str, Any] = {
+            "model": request.model,
+            "messages": [
+                {"role": "system", "content": request.instructions},
+                {"role": "user", "content": request.input_text},
+            ],
+        }
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+        if request.max_output_tokens is not None:
+            _set_chat_max_tokens(kwargs, self._max_tokens_param, request.max_output_tokens)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            raise ModelGatewayError(f"OpenAI Chat Completions text request failed: {exc}") from exc
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        usage = getattr(response, "usage", None)
+        return TextModelResponse(
+            text=_parse_chat_completion_text(response),
+            provider=self._provider,
+            model=request.model,
+            latency_ms=latency_ms,
+            raw_response_id=getattr(response, "id", None),
+            input_tokens=_usage_first(usage, "input_tokens", "prompt_tokens"),
+            output_tokens=_usage_first(usage, "output_tokens", "completion_tokens"),
+        )
+
     def _build_client(self) -> Any:
         try:
             from openai import OpenAI
@@ -246,19 +338,40 @@ class FakeModelClient:
         self,
         response: Mapping[str, Any] | Callable[[ModelRequest], Mapping[str, Any]],
         *,
+        text_response: str | Callable[[TextModelRequest], str] | None = None,
         provider: str = "fake",
         latency_ms: int = 0,
     ) -> None:
         self._response = response
+        self._text_response = text_response
         self.provider = provider
         self.latency_ms = latency_ms
         self.requests: list[ModelRequest] = []
+        self.text_requests: list[TextModelRequest] = []
 
     def generate_structured(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         payload = self._response(request) if callable(self._response) else self._response
         return ModelResponse(
             parsed=dict(payload),
+            provider=self.provider,
+            model=request.model,
+            latency_ms=self.latency_ms,
+            cached=True,
+        )
+
+    def generate_text(self, request: TextModelRequest) -> TextModelResponse:
+        self.text_requests.append(request)
+        if callable(self._text_response):
+            text = self._text_response(request)
+        elif self._text_response is not None:
+            text = self._text_response
+        elif isinstance(self._response, Mapping):
+            text = str(self._response.get("text") or self._response.get("answer") or "")
+        else:
+            text = ""
+        return TextModelResponse(
+            text=text,
             provider=self.provider,
             model=request.model,
             latency_ms=self.latency_ms,
@@ -279,6 +392,40 @@ def _parse_response_json(response: Any) -> dict[str, Any]:
                 return _loads_json_object(text)
 
     raise ModelOutputValidationError("OpenAI response did not contain JSON output text")
+
+
+def _parse_response_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    output = getattr(response, "output", None) or []
+    parts: list[str] = []
+    for item in output:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    if parts:
+        return "\n".join(parts)
+    raise ModelOutputValidationError("OpenAI response did not contain text output")
+
+
+def _parse_chat_completion_text(response: Any) -> str:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise ModelOutputValidationError("chat completion response did not contain choices")
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if message is None:
+        raise ModelOutputValidationError("chat completion response did not contain a message")
+    text = _message_text(message).strip()
+    if not text:
+        raise ModelOutputValidationError(
+            "chat completion message did not contain content"
+            f" ({_empty_chat_message_detail(choice, message)})"
+        )
+    return text
 
 
 def _parse_chat_completion_json(response: Any) -> dict[str, Any]:

@@ -195,6 +195,14 @@ class PromptOrchestrator:
 
     def _generate_prompt(self, prompt_request: PromptGenerationRequest) -> PromptGenerationResult:
         model = self._model_for_prompt_request(prompt_request)
+        if (
+            model is not None
+            and self._public_knowledge_model is not None
+            and model == self._public_knowledge_model
+            and _is_public_knowledge_request(prompt_request)
+            and hasattr(self._prompt_service, "generate_public_knowledge_prompt")
+        ):
+            return self._prompt_service.generate_public_knowledge_prompt(prompt_request, model=model)
         if model is not None:
             return self._prompt_service.generate_prompt(prompt_request, model=model)
         return self._prompt_service.generate_prompt(prompt_request)

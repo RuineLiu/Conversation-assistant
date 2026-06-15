@@ -10,6 +10,8 @@ from proactive_assistant.model_gateway.clients import (
     ModelResponse,
     OpenAIChatCompletionsClient,
     OpenAIResponsesClient,
+    TextModelRequest,
+    TextModelResponse,
 )
 from proactive_assistant.model_gateway.embeddings import (
     EmbeddingClient,
@@ -34,4 +36,6 @@ __all__ = [
     "OpenAIChatCompletionsClient",
     "OpenAIEmbeddingClient",
     "OpenAIResponsesClient",
+    "TextModelRequest",
+    "TextModelResponse",
 ]

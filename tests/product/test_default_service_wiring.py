@@ -261,6 +261,21 @@ def test_build_opportunity_detector_default_wires_llm_opportunity_arm() -> None:
         )
 
     assert isinstance(detector._opportunity_detector, OpportunityDetector)
+    assert detector._rule_first_detection is True
+
+
+def test_build_opportunity_detector_rule_first_can_be_disabled() -> None:
+    fake_client = FakeModelClient({"opportunities": [], "detection_notes": "", "safety_flags": []})
+    memory_service, _, _ = _make_memory_service_for_test()
+
+    with patch.dict(os.environ, {"PROACTIVE_RULE_FIRST_DETECTION": "off"}):
+        detector = _build_opportunity_detector(
+            model_client=fake_client,
+            settings=ModelGatewaySettings(default_model="gpt-test"),
+            memory_service=memory_service,
+        )
+
+    assert detector._rule_first_detection is False
 
 
 def test_build_opportunity_detector_opportunity_arm_disabled_by_env() -> None:

@@ -542,8 +542,9 @@ def test_orchestrator_routes_public_knowledge_question_to_public_model() -> None
 
     orchestrator.run(snapshot)
 
-    assert client.requests
-    assert client.requests[0].model == "gpt-factual"
+    assert client.text_requests
+    assert client.text_requests[0].model == "gpt-factual"
+    assert client.requests == []
 
 
 def test_orchestrator_keeps_business_gap_on_generation_model() -> None:
