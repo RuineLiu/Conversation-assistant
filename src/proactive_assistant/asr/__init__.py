@@ -3,10 +3,11 @@
 from proactive_assistant.asr.azure import AzureSpeechRestRecognizer
 from proactive_assistant.asr.azure_streaming import AzureSpeechSDKStreamingRecognizer
 from proactive_assistant.asr.aliyun_streaming import AliyunDashScopeStreamingRecognizer
+from proactive_assistant.asr.volcengine_streaming import VolcengineBigModelStreamingRecognizer
 from proactive_assistant.asr.contracts import SpeechTranscriptionResult
 from proactive_assistant.asr.partial import PartialTranscriptAggregator, SoftTranscriptSegment, normalize_partial_text
 from proactive_assistant.asr.service import FakeSpeechRecognizer, SpeechRecognitionError, SpeechRecognitionService, SpeechRecognizer
-from proactive_assistant.asr.settings import AliyunSpeechSettings, AzureSpeechSettings
+from proactive_assistant.asr.settings import AliyunSpeechSettings, AzureSpeechSettings, VolcengineSpeechSettings
 from proactive_assistant.asr.streaming import (
     FakeStreamingSpeechRecognizer,
     StreamingSpeechEvent,
@@ -20,8 +21,10 @@ __all__ = [
     "AzureSpeechRestRecognizer",
     "AzureSpeechSDKStreamingRecognizer",
     "AliyunDashScopeStreamingRecognizer",
+    "VolcengineBigModelStreamingRecognizer",
     "AliyunSpeechSettings",
     "AzureSpeechSettings",
+    "VolcengineSpeechSettings",
     "FakeSpeechRecognizer",
     "FakeStreamingSpeechRecognizer",
     "PartialTranscriptAggregator",

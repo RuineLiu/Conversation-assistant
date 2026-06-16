@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from proactive_assistant.asr import (
     AliyunDashScopeStreamingRecognizer,
     AliyunSpeechSettings,
+    VolcengineBigModelStreamingRecognizer,
+    VolcengineSpeechSettings,
     AzureSpeechRestRecognizer,
     AzureSpeechSDKStreamingRecognizer,
     PartialTranscriptAggregator,
@@ -616,7 +618,20 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             if _partial_prompts_enabled(partial_prompts)
             else None
         )
-        await websocket.send_json(
+        # All WS sends go through one lock so the read loop and the background
+        # LLM workers never interleave frames on the same socket.
+        send_lock = asyncio.Lock()
+
+        async def ws_send(data: dict[str, Any]) -> None:
+            if state["client_disconnected"]:
+                return
+            try:
+                async with send_lock:
+                    await websocket.send_json(data)
+            except Exception:
+                state["client_disconnected"] = True
+
+        await ws_send(
             {
                 "type": "stream_opened",
                 "session_id": session_id,
@@ -627,6 +642,8 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
         )
 
         async def receive_audio() -> None:
+            total_bytes = 0
+            last_audio_log = time.monotonic()
             try:
                 while not stop_event.is_set():
                     message = await websocket.receive()
@@ -635,7 +652,21 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                         break
                     audio = message.get("bytes")
                     if audio:
+                        total_bytes += len(audio)
+                        _w0 = time.monotonic()
                         await asyncio.to_thread(stream.write_audio, audio)
+                        _wdt = time.monotonic() - _w0
+                        _now = time.monotonic()
+                        if _now - last_audio_log > 2.0:
+                            last_audio_log = _now
+                            # recv = 后端已收到的音频秒数(16k/16bit/mono => 32000 B/s)
+                            recv_sec = total_bytes / 32000.0
+                            elapsed = _now - stream_started_at
+                            print(
+                                f"[audio] recv={recv_sec:.1f}s elapsed={elapsed:.1f}s "
+                                f"transport_gap={elapsed - recv_sec:.1f}s last_write={_wdt * 1000:.0f}ms",
+                                flush=True,
+                            )
                         continue
                     text = message.get("text")
                     if text and _stream_control_type(text) in {"stop", "end_audio", "close"}:
@@ -645,6 +676,144 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             finally:
                 await asyncio.to_thread(stream.end_audio)
 
+        # ── Decoupled LLM workers ───────────────────────────────────────────
+        # The read loop must NEVER await an LLM call: doing so stalls reading
+        # ASR events/audio, so the audio clock falls tens of seconds behind
+        # wall clock and latency compounds over a long conversation. Preview
+        # and final pipelines run in background workers instead; the read loop
+        # only reads events, streams partials, and hands work off.
+        preview_holder: dict[str, Any] = {"item": None}   # latest partial preview wins
+        preview_ready = asyncio.Event()
+        final_queue: asyncio.Queue = asyncio.Queue(maxsize=2)  # bounded; drop oldest when backed up
+
+        async def preview_worker() -> None:
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(preview_ready.wait(), timeout=0.2)
+                except TimeoutError:
+                    continue
+                preview_ready.clear()
+                item = preview_holder["item"]
+                preview_holder["item"] = None
+                if item is None:
+                    continue
+                soft_segment = item["soft_segment"]
+                event = item["event"]
+                preview_t0 = time.monotonic()
+                preview_n = -1
+                preview_err = ""
+                preview_payload: dict[str, Any] = {
+                    "type": "prompt_preview",
+                    "session_id": session_id,
+                    "transcription": item["transcription"],
+                    "soft_segment": _soft_segment_payload(soft_segment),
+                }
+                try:
+                    preview_step = await asyncio.to_thread(
+                        service.preview_transcript_prompts,
+                        session_id,
+                        TranscriptSegmentInput(
+                            speaker=soft_segment.speaker,
+                            start_ms=soft_segment.start_ms,
+                            end_ms=soft_segment.end_ms,
+                            text=soft_segment.text,
+                            asr_confidence=event.confidence if event.confidence > 0 else 1.0,
+                            language=event.language or language,
+                            is_final=False,
+                            source=SessionSource.LIVE_ASR_FUTURE,
+                            metadata={
+                                "asr_provider": str(event.metadata.get("provider", "streaming")),
+                                "asr_streaming": True,
+                                "asr_partial": True,
+                                "soft_segment_reason": soft_segment.reason,
+                            },
+                        ),
+                        segment_id=f"{session_id}_{soft_segment.segment_id}",
+                        max_segments=max_segments,
+                        use_memory=_partial_prompt_memory_enabled() and use_memory,
+                        max_prompts=1,
+                    )
+                except Exception as exc:
+                    preview_payload["prompt_preview_error"] = str(exc)
+                    preview_err = f"{type(exc).__name__}: {exc}"
+                else:
+                    preview_payload["prompt_preview"] = preview_step.model_dump(mode="json")
+                    preview_n = len(preview_step.prompts)
+                _spk_end = stream_started_at + soft_segment.end_ms / 1000.0
+                print(
+                    f"[ttft] PREVIEW seg={soft_segment.segment_id} text={soft_segment.text!r} "
+                    f"speech->preview={time.monotonic() - _spk_end:.2f}s "
+                    f"compute={time.monotonic() - preview_t0:.2f}s prompts={preview_n}"
+                    + (f" ERROR={preview_err}" if preview_err else ""),
+                    flush=True,
+                )
+                await ws_send(preview_payload)
+
+        async def final_worker() -> None:
+            while True:
+                try:
+                    item = await asyncio.wait_for(final_queue.get(), timeout=0.2)
+                except TimeoutError:
+                    if stop_event.is_set() and final_queue.empty():
+                        break
+                    continue
+                if item is None:
+                    break
+                event = item["event"]
+                segment_id = item["segment_id"]
+                start_ms = item["start_ms"]
+                end_ms = item["end_ms"]
+                final_recv_at = item["recv_at"]
+                payload = item["payload"]
+                final_n = -1
+                final_err = ""
+                pipe_t0 = time.monotonic()
+                try:
+                    transcript_step = await asyncio.to_thread(
+                        service.append_transcript_and_generate_prompts,
+                        session_id,
+                        TranscriptSegmentInput(
+                            speaker=speaker,
+                            start_ms=start_ms,
+                            end_ms=end_ms,
+                            text=event.text,
+                            asr_confidence=event.confidence if event.confidence > 0 else 1.0,
+                            language=event.language or language,
+                            is_final=True,
+                            source=SessionSource.LIVE_ASR_FUTURE,
+                            metadata={
+                                "asr_provider": str(event.metadata.get("provider", "streaming")),
+                                "asr_streaming": True,
+                            },
+                        ),
+                        segment_id=segment_id,
+                        max_segments=max_segments,
+                        use_memory=use_memory,
+                        memory_limit=memory_limit,
+                        include_pending_memory=include_pending_memory,
+                        policy_version=policy_version,
+                    )
+                except Exception as exc:
+                    payload["transcript_error"] = str(exc)
+                    final_err = f"{type(exc).__name__}: {exc}"
+                else:
+                    payload["transcript_step"] = transcript_step.model_dump(mode="json")
+                    final_n = len(transcript_step.prompts)
+                _spk_end = stream_started_at + end_ms / 1000.0
+                _asr_lag = max(0.0, final_recv_at - _spk_end)
+                _backend = time.monotonic() - pipe_t0
+                print(
+                    f"[ttft] FINAL seg={segment_id} text={event.text!r} "
+                    f"asr_final_lag={_asr_lag:.2f}s backend={_backend:.2f}s "
+                    f"total(speech_end->card)={_asr_lag + (time.monotonic() - final_recv_at):.2f}s "
+                    f"reconciled={payload.get('preview_reconciled', False)} prompts={final_n} "
+                    f"[raw offset_ms={event.offset_ms} dur_ms={event.duration_ms} "
+                    f"end_ms={end_ms} elapsed_since_open={time.monotonic() - stream_started_at:.1f}s]"
+                    + (f" ERROR={final_err}" if final_err else ""),
+                    flush=True,
+                )
+                await ws_send(payload)
+
         async def send_events() -> None:
             while not stop_event.is_set():
                 event = await asyncio.to_thread(stream.read_event, 0.1)
@@ -653,8 +822,18 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                 payload = _streaming_event_payload(event)
                 event_type = StreamingSpeechEventType(event.event_type)
                 if event_type == StreamingSpeechEventType.PARTIAL_TRANSCRIPT and event.text.strip():
-                    if not state["client_disconnected"]:
-                        await websocket.send_json(payload)
+                    await ws_send(payload)
+                    _now = time.monotonic()
+                    if _now - float(state.get("last_partial_log", 0.0)) > 1.0:
+                        state["last_partial_log"] = _now
+                        # offset_ms = 这段音频在流里的位置;elapsed = 墙钟。两者差距 = 音频喂入滞后。
+                        _audio_pos = (event.offset_ms or 0) / 1000.0
+                        print(
+                            f"[partial] {event.text[-14:]!r} audio_pos={_audio_pos:.1f}s "
+                            f"elapsed={_now - stream_started_at:.1f}s "
+                            f"feed_lag={(_now - stream_started_at) - _audio_pos:.1f}s",
+                            flush=True,
+                        )
                     if partial_aggregator is not None:
                         fallback_start_ms, fallback_end_ms = _stream_segment_timing(
                             event,
@@ -669,45 +848,17 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                         )
                         if soft_segment is not None:
                             state["last_preview_segment_id"] = soft_segment.segment_id
-                            preview_payload: dict[str, Any] = {
-                                "type": "prompt_preview",
-                                "session_id": session_id,
+                            # hand to background preview worker (latest wins) —
+                            # never block the read loop on the preview LLM call.
+                            preview_holder["item"] = {
+                                "soft_segment": soft_segment,
+                                "event": event,
                                 "transcription": payload["transcription"],
-                                "soft_segment": _soft_segment_payload(soft_segment),
                             }
-                            try:
-                                preview_step = await asyncio.to_thread(
-                                    service.preview_transcript_prompts,
-                                    session_id,
-                                    TranscriptSegmentInput(
-                                        speaker=soft_segment.speaker,
-                                        start_ms=soft_segment.start_ms,
-                                        end_ms=soft_segment.end_ms,
-                                        text=soft_segment.text,
-                                        asr_confidence=event.confidence if event.confidence > 0 else 1.0,
-                                        language=event.language or language,
-                                        is_final=False,
-                                        source=SessionSource.LIVE_ASR_FUTURE,
-                                        metadata={
-                                            "asr_provider": str(event.metadata.get("provider", "streaming")),
-                                            "asr_streaming": True,
-                                            "asr_partial": True,
-                                            "soft_segment_reason": soft_segment.reason,
-                                        },
-                                    ),
-                                    segment_id=f"{session_id}_{soft_segment.segment_id}",
-                                    max_segments=max_segments,
-                                    use_memory=_partial_prompt_memory_enabled() and use_memory,
-                                    max_prompts=1,
-                                )
-                            except Exception as exc:
-                                preview_payload["prompt_preview_error"] = str(exc)
-                            else:
-                                preview_payload["prompt_preview"] = preview_step.model_dump(mode="json")
-                            if not state["client_disconnected"]:
-                                await websocket.send_json(preview_payload)
+                            preview_ready.set()
                     continue
                 if event_type == StreamingSpeechEventType.FINAL_TRANSCRIPT and event.text.strip():
+                    final_recv_at = time.monotonic()
                     state["final_count"] = int(state["final_count"]) + 1
                     start_ms, end_ms = _stream_segment_timing(event, stream_started_at, int(state["last_final_end_ms"]))
                     state["last_final_end_ms"] = end_ms
@@ -715,41 +866,30 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                     if partial_aggregator is not None and partial_aggregator.matches_last_preview(event.text):
                         payload["preview_reconciled"] = True
                         payload["preview_segment_id"] = state["last_preview_segment_id"]
+                    # hand to background final worker; bounded queue drops the
+                    # oldest pending final when backed up (latest speech wins),
+                    # so the card pipeline never falls tens of seconds behind.
+                    item = {
+                        "event": event,
+                        "segment_id": segment_id,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "recv_at": final_recv_at,
+                        "payload": payload,
+                    }
+                    if final_queue.full():
+                        try:
+                            dropped = final_queue.get_nowait()
+                            print(f"[ttft] DROP stale final seg={dropped['segment_id']} (backlog)", flush=True)
+                        except asyncio.QueueEmpty:
+                            pass
                     try:
-                        # Run the full product pipeline (detection +
-                        # orchestration + potentially blocking LLM calls)
-                        # off the event loop. Doing it inline would stall
-                        # WebSocket keepalive pings and trip a 1011 close.
-                        transcript_step = await asyncio.to_thread(
-                            service.append_transcript_and_generate_prompts,
-                            session_id,
-                            TranscriptSegmentInput(
-                                speaker=speaker,
-                                start_ms=start_ms,
-                                end_ms=end_ms,
-                                text=event.text,
-                                asr_confidence=event.confidence if event.confidence > 0 else 1.0,
-                                language=event.language or language,
-                                is_final=True,
-                                source=SessionSource.LIVE_ASR_FUTURE,
-                                metadata={
-                                    "asr_provider": str(event.metadata.get("provider", "streaming")),
-                                    "asr_streaming": True,
-                                },
-                            ),
-                            segment_id=segment_id,
-                            max_segments=max_segments,
-                            use_memory=use_memory,
-                            memory_limit=memory_limit,
-                            include_pending_memory=include_pending_memory,
-                            policy_version=policy_version,
-                        )
-                    except Exception as exc:
-                        payload["transcript_error"] = str(exc)
-                    else:
-                        payload["transcript_step"] = transcript_step.model_dump(mode="json")
-                if not state["client_disconnected"]:
-                    await websocket.send_json(payload)
+                        final_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        pass
+                    continue
+                # non-transcript events (session_stopped / canceled / error)
+                await ws_send(payload)
                 if event_type in {
                     StreamingSpeechEventType.SESSION_STOPPED,
                     StreamingSpeechEventType.CANCELED,
@@ -761,6 +901,8 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
         final_drain_timeout = _stream_final_drain_timeout_seconds()
         receiver = asyncio.create_task(receive_audio())
         sender = asyncio.create_task(send_events())
+        preview_task = asyncio.create_task(preview_worker())
+        final_task = asyncio.create_task(final_worker())
         try:
             await asyncio.wait({receiver, sender}, return_when=asyncio.FIRST_COMPLETED)
             if receiver.done() and not sender.done():
@@ -773,7 +915,13 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
         finally:
             stop_event.set()
             await asyncio.to_thread(stream.stop)
-            for task in (receiver, sender):
+            # let the background workers drain queued cards before tearing down
+            preview_ready.set()
+            try:
+                await asyncio.wait_for(final_task, timeout=final_drain_timeout)
+            except TimeoutError:
+                pass
+            for task in (receiver, sender, preview_task, final_task):
                 if not task.done():
                     task.cancel()
             if not state["client_disconnected"]:
@@ -1381,6 +1529,11 @@ def _build_streaming_speech_service(settings: AzureSpeechSettings | None = None)
         if not aliyun_settings.is_configured:
             return None
         return StreamingSpeechRecognitionService(AliyunDashScopeStreamingRecognizer(aliyun_settings))
+    if provider in {"volcengine", "volc", "doubao"}:
+        volc_settings = VolcengineSpeechSettings()
+        if not volc_settings.is_configured:
+            return None
+        return StreamingSpeechRecognitionService(VolcengineBigModelStreamingRecognizer(volc_settings))
     if provider not in {"", "azure", "microsoft"}:
         return None
     resolved_settings = settings or AzureSpeechSettings()

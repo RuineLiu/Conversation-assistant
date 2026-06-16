@@ -79,8 +79,12 @@ class InMemoryRuntimeStore:
         self._memory_order: list[str] = []
 
     def add_decision(self, decision: PromptDecisionRecord) -> PromptDecisionRecord:
-        if decision.decision_id in self._decisions:
-            raise DecisionRecordAlreadyExistsError(f"decision already exists: {decision.decision_id}")
+        existing = self._decisions.get(decision.decision_id)
+        if existing is not None:
+            # 幂等:同一 decision_id 重复写(典型是 WS 会话重连后 segment 计数从 stream_0001
+            # 重来,撞上一轮的 decision_id)直接返回已存在的,不抛错、不覆盖。
+            # 实时流水线因此不会再因重复 id 崩溃(prompts=-1)。语义上"同一决策不重复记"。
+            return existing
         self._decisions[decision.decision_id] = decision
         self._decision_order.append(decision.decision_id)
         return decision

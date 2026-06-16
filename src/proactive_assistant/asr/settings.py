@@ -141,3 +141,43 @@ class AliyunSpeechSettings(BaseSettings):
     @property
     def is_configured(self) -> bool:
         return self.api_key is not None
+
+
+class VolcengineSpeechSettings(BaseSettings):
+    """豆包大模型流式语音识别(火山引擎 v3 sauc bigmodel)。"""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    app_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VOLC_ASR_APP_KEY", "VOLC_ASR_APP_ID", "DOUBAO_ASR_APP_KEY"),
+    )
+    access_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VOLC_ASR_ACCESS_KEY", "VOLC_ASR_API_KEY", "DOUBAO_ASR_API_KEY"),
+    )
+    resource_id: str = Field(
+        default="volc.bigasr.sauc.duration",
+        validation_alias=AliasChoices("VOLC_ASR_RESOURCE_ID", "DOUBAO_ASR_RESOURCE_ID"),
+    )
+    endpoint: str = Field(
+        default="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        validation_alias=AliasChoices("VOLC_ASR_ENDPOINT", "DOUBAO_ASR_ENDPOINT"),
+    )
+    speech_language: str = Field(
+        default="zh-CN",
+        validation_alias=AliasChoices("VOLC_ASR_LANGUAGE", "DOUBAO_ASR_LANGUAGE"),
+    )
+    sample_rate: int = Field(
+        default=16000,
+        validation_alias=AliasChoices("VOLC_ASR_SAMPLE_RATE", "DOUBAO_ASR_SAMPLE_RATE"),
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        return self.app_key is not None and self.access_key is not None
