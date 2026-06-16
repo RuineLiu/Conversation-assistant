@@ -134,6 +134,40 @@ def test_product_flow_appends_transcript_generates_prompt_and_logs_decision() ->
     assert "这个问题谁负责" in client.requests[0].input_text
 
 
+def test_product_flow_does_not_relog_prior_segment_prompt_on_followup_final() -> None:
+    service, _client = make_product_service(
+        valid_prompt_response(
+            prompt_category="person_or_fact",
+            glasses_title="上周模型测评",
+            glasses_text="模型测评问题",
+            app_detail_text="需要确认上周模型测评的问题。",
+        )
+    )
+    session = service.create_session(
+        SessionConfig(title="Model eval recall", pre_context="讨论上周模型测评。"),
+        session_id="session_recall_001",
+    )
+
+    first = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("你们谁还记得我们上周说的那个呃模型测评的问题？"),
+        segment_id="seg_recall_001",
+    )
+    second = service.append_transcript_and_generate_prompts(
+        session.session_id,
+        transcript("就是呃你说的那个模型测评哦，对哦，好像。"),
+        segment_id="seg_recall_002",
+    )
+
+    assert len(first.prompts) == 1
+    assert second.prompts == []
+    assert [item.text for item in service.list_transcript(session.session_id)] == [
+        "你们谁还记得我们上周说的那个呃模型测评的问题？",
+        "就是呃你说的那个模型测评哦，对哦，好像。",
+    ]
+    assert len(service.list_prompt_decisions(session_id=session.session_id)) == 1
+
+
 def test_product_flow_transcribes_audio_and_runs_prompt_flow() -> None:
     speech = FakeSpeechRecognizer(text="这个问题谁负责，下周五 deadline 前能不能定？")
     service, _client = make_product_service(speech_recognizer=speech)

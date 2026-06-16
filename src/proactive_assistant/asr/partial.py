@@ -13,6 +13,7 @@ _TRIGGER_PATTERN = re.compile(
     r"ddl|deadline|风险|阻塞|待办|todo|action|导演|作者|解释|是什么意思)",
     re.IGNORECASE,
 )
+_TERMINAL_PARTICLE_PATTERN = re.compile(r"(吗|呢|么|吧|？|\?)\s*$")
 
 
 @dataclass(frozen=True)
@@ -73,9 +74,14 @@ class PartialTranscriptAggregator:
         reason = ""
         if has_trigger and (delta_chars >= self._min_delta_chars or not self._last_emitted_norm):
             reason = "trigger_terms"
-        elif elapsed_ms >= self._max_soft_interval_ms and delta_chars >= self._min_delta_chars:
+        elif (
+            has_trigger
+            and _has_question_like_boundary(text)
+            and elapsed_ms >= self._max_soft_interval_ms
+            and delta_chars >= self._min_delta_chars
+        ):
             reason = "max_soft_interval"
-        elif elapsed_ms >= self._min_emit_interval_ms and delta_chars >= self._min_delta_chars * 2:
+        elif has_trigger and elapsed_ms >= self._min_emit_interval_ms and delta_chars >= self._min_delta_chars * 2:
             reason = "stable_growth"
         if not reason:
             return None
@@ -108,6 +114,11 @@ class PartialTranscriptAggregator:
 def normalize_partial_text(text: str) -> str:
     lowered = text.strip().lower()
     return re.sub(r"[\s,，。.!！?？:：;；、\"'“”‘’（）()\[\]{}<>《》]+", "", lowered)
+
+
+def _has_question_like_boundary(text: str) -> bool:
+    stripped = text.strip()
+    return bool(_TERMINAL_PARTICLE_PATTERN.search(stripped))
 
 
 def _new_text_delta(previous: str, current: str) -> int:

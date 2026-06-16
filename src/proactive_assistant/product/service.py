@@ -338,6 +338,7 @@ class ProductAssistantService:
             snapshot,
             extra_opportunities=state_opportunities,
         )
+        opportunities = _opportunities_for_segment(opportunities, transcript_segment.segment_id)
         # A4: glasses shows a single prompt. Generate only the top-ranked
         # opportunity (already sorted by priority/category/confidence) so the
         # realtime path makes one generation call instead of up to N.
@@ -440,6 +441,7 @@ class ProductAssistantService:
             metadata={**session.metadata, "provisional": True},
         )
         opportunities = self.prompt_orchestrator.select_opportunities(snapshot)
+        opportunities = _opportunities_for_segment(opportunities, transcript_segment.segment_id)
         if max_prompts > 0:
             opportunities = opportunities[:max_prompts]
         candidates = [
@@ -1466,6 +1468,14 @@ def _prd_surface_for_opportunity(opportunity: Any) -> str:
     if str(_enum_value(opportunity.priority)) == "P2":
         return "app_prompt_tab"
     return "glasses_popup"
+
+
+def _opportunities_for_segment(opportunities: list[Any], segment_id: str) -> list[Any]:
+    return [
+        opportunity
+        for opportunity in opportunities
+        if segment_id in set(getattr(opportunity, "trigger_segment_ids", []))
+    ]
 
 
 def _optional_int(value: object) -> int | None:

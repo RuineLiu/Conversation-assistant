@@ -49,3 +49,34 @@ def test_partial_aggregator_ignores_short_non_trigger_partial() -> None:
     )
 
     assert segment is None
+
+
+def test_partial_aggregator_does_not_emit_incomplete_filler_continuation() -> None:
+    aggregator = PartialTranscriptAggregator(
+        min_chars=4,
+        min_emit_interval_ms=0,
+        max_soft_interval_ms=0,
+    )
+    aggregator.observe(
+        StreamingSpeechEvent(
+            event_type=StreamingSpeechEventType.PARTIAL_TRANSCRIPT,
+            text="你们谁还记得我们上周说的那个模型？",
+            language="zh-CN",
+        ),
+        speaker="Bao",
+        fallback_start_ms=0,
+        fallback_end_ms=1000,
+    )
+
+    segment = aggregator.observe(
+        StreamingSpeechEvent(
+            event_type=StreamingSpeechEventType.PARTIAL_TRANSCRIPT,
+            text="就是呃，你说的那",
+            language="zh-CN",
+        ),
+        speaker="Bao",
+        fallback_start_ms=1200,
+        fallback_end_ms=1800,
+    )
+
+    assert segment is None

@@ -460,7 +460,10 @@ def _is_high_privacy(opportunity: PromptOpportunity) -> bool:
 
 
 def _candidate_id(opportunity: PromptOpportunity, status: str) -> str:
-    digest = sha1(f"{opportunity.opportunity_id}:{status}".encode("utf-8")).hexdigest()[:12]
+    trigger_key = "|".join(opportunity.trigger_segment_ids)
+    digest = sha1(
+        f"{opportunity.opportunity_id}:{trigger_key}:{opportunity.captured_text}:{status}".encode("utf-8")
+    ).hexdigest()[:12]
     return f"cand_{digest}"
 
 
