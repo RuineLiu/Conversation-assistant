@@ -13,6 +13,7 @@ from proactive_assistant.asr import (
     AliyunSpeechSettings,
     AzureSpeechRestRecognizer,
     AzureSpeechSDKStreamingRecognizer,
+    PartialTranscriptAggregator,
     AzureSpeechSettings,
     SpeechRecognitionError,
     SpeechRecognitionService,
@@ -582,6 +583,7 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
         memory_limit: int = Query(default=8, ge=1, le=50),
         include_pending_memory: bool = Query(default=False),
         policy_version: str = Query(default="product_streaming_asr_v0"),
+        partial_prompts: bool = Query(default=True),
     ) -> None:
         await websocket.accept()
         try:
@@ -603,7 +605,17 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
             "last_final_end_ms": 0,
             "final_count": 0,
             "client_disconnected": False,
+            "last_preview_segment_id": "",
         }
+        partial_aggregator = (
+            PartialTranscriptAggregator(
+                min_chars=_partial_prompt_min_chars(),
+                min_emit_interval_ms=_partial_prompt_min_interval_ms(),
+                max_soft_interval_ms=_partial_prompt_max_interval_ms(),
+            )
+            if _partial_prompts_enabled(partial_prompts)
+            else None
+        )
         await websocket.send_json(
             {
                 "type": "stream_opened",
@@ -640,11 +652,69 @@ def create_app(product_service: ProductAssistantService | None = None) -> FastAP
                     continue
                 payload = _streaming_event_payload(event)
                 event_type = StreamingSpeechEventType(event.event_type)
+                if event_type == StreamingSpeechEventType.PARTIAL_TRANSCRIPT and event.text.strip():
+                    if not state["client_disconnected"]:
+                        await websocket.send_json(payload)
+                    if partial_aggregator is not None:
+                        fallback_start_ms, fallback_end_ms = _stream_segment_timing(
+                            event,
+                            stream_started_at,
+                            int(state["last_final_end_ms"]),
+                        )
+                        soft_segment = partial_aggregator.observe(
+                            event,
+                            speaker=speaker,
+                            fallback_start_ms=fallback_start_ms,
+                            fallback_end_ms=fallback_end_ms,
+                        )
+                        if soft_segment is not None:
+                            state["last_preview_segment_id"] = soft_segment.segment_id
+                            preview_payload: dict[str, Any] = {
+                                "type": "prompt_preview",
+                                "session_id": session_id,
+                                "transcription": payload["transcription"],
+                                "soft_segment": _soft_segment_payload(soft_segment),
+                            }
+                            try:
+                                preview_step = await asyncio.to_thread(
+                                    service.preview_transcript_prompts,
+                                    session_id,
+                                    TranscriptSegmentInput(
+                                        speaker=soft_segment.speaker,
+                                        start_ms=soft_segment.start_ms,
+                                        end_ms=soft_segment.end_ms,
+                                        text=soft_segment.text,
+                                        asr_confidence=event.confidence if event.confidence > 0 else 1.0,
+                                        language=event.language or language,
+                                        is_final=False,
+                                        source=SessionSource.LIVE_ASR_FUTURE,
+                                        metadata={
+                                            "asr_provider": str(event.metadata.get("provider", "streaming")),
+                                            "asr_streaming": True,
+                                            "asr_partial": True,
+                                            "soft_segment_reason": soft_segment.reason,
+                                        },
+                                    ),
+                                    segment_id=f"{session_id}_{soft_segment.segment_id}",
+                                    max_segments=max_segments,
+                                    use_memory=_partial_prompt_memory_enabled() and use_memory,
+                                    max_prompts=1,
+                                )
+                            except Exception as exc:
+                                preview_payload["prompt_preview_error"] = str(exc)
+                            else:
+                                preview_payload["prompt_preview"] = preview_step.model_dump(mode="json")
+                            if not state["client_disconnected"]:
+                                await websocket.send_json(preview_payload)
+                    continue
                 if event_type == StreamingSpeechEventType.FINAL_TRANSCRIPT and event.text.strip():
                     state["final_count"] = int(state["final_count"]) + 1
                     start_ms, end_ms = _stream_segment_timing(event, stream_started_at, int(state["last_final_end_ms"]))
                     state["last_final_end_ms"] = end_ms
                     segment_id = f"{session_id}_stream_{int(state['final_count']):04d}"
+                    if partial_aggregator is not None and partial_aggregator.matches_last_preview(event.text):
+                        payload["preview_reconciled"] = True
+                        payload["preview_segment_id"] = state["last_preview_segment_id"]
                     try:
                         # Run the full product pipeline (detection +
                         # orchestration + potentially blocking LLM calls)
@@ -1342,6 +1412,35 @@ def _stream_final_drain_timeout_seconds() -> float:
     return max(1.0, value)
 
 
+def _partial_prompts_enabled(requested: bool) -> bool:
+    return requested and _env_flag_enabled("PROACTIVE_ASR_PARTIAL_PROMPTS", default="on")
+
+
+def _partial_prompt_memory_enabled() -> bool:
+    return _env_flag_enabled("PROACTIVE_ASR_PARTIAL_PROMPT_MEMORY", default="off")
+
+
+def _partial_prompt_min_chars() -> int:
+    return _env_int("PROACTIVE_ASR_PARTIAL_PROMPT_MIN_CHARS", 6, minimum=1)
+
+
+def _partial_prompt_min_interval_ms() -> int:
+    return _env_int("PROACTIVE_ASR_PARTIAL_PROMPT_MIN_INTERVAL_MS", 700, minimum=0)
+
+
+def _partial_prompt_max_interval_ms() -> int:
+    return _env_int("PROACTIVE_ASR_PARTIAL_PROMPT_MAX_INTERVAL_MS", 1800, minimum=0)
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 def _streaming_event_payload(event: StreamingSpeechEvent) -> dict[str, Any]:
     return {
         "type": str(event.event_type),
@@ -1355,6 +1454,18 @@ def _streaming_event_payload(event: StreamingSpeechEvent) -> dict[str, Any]:
             "metadata": dict(event.metadata),
         },
         "raw_response": dict(event.raw_response),
+    }
+
+
+def _soft_segment_payload(segment: Any) -> dict[str, Any]:
+    return {
+        "segment_id": segment.segment_id,
+        "text": segment.text,
+        "speaker": segment.speaker,
+        "start_ms": segment.start_ms,
+        "end_ms": segment.end_ms,
+        "reason": segment.reason,
+        "normalized_text": segment.normalized_text,
     }
 
 

@@ -246,14 +246,22 @@ def test_streaming_asr_websocket_appends_final_transcript_and_generates_prompt()
         websocket.send_bytes(b"\0" * 3200)
         websocket.send_json({"type": "stop"})
         events = [opened]
-        for _ in range(5):
+        for _ in range(6):
             event = websocket.receive_json()
             events.append(event)
             if event["type"] == "final_transcript":
                 break
 
+    preview = next(event for event in events if event["type"] == "prompt_preview")
+    assert preview["soft_segment"]["text"].startswith("这个问题谁负责")
+    assert preview["soft_segment"]["reason"] == "trigger_terms"
+    assert preview["prompt_preview"]["transcript_segment"]["is_final"] is False
+    assert preview["prompt_preview"]["prompts"][0]["prompt_category"] == "summary_gap_check"
+    assert preview["prompt_preview"]["prompts"][0]["should_display"] is True
+
     final = next(event for event in events if event["type"] == "final_transcript")
     assert final["transcription"]["text"].startswith("这个问题谁负责")
+    assert final["preview_reconciled"] is True
     assert final["transcript_step"]["transcript_segment"]["source"] == "live_asr_future"
     assert final["transcript_step"]["prompts"][0]["prompt_category"] == "summary_gap_check"
     assert final["transcript_step"]["prompts"][0]["should_display"] is True

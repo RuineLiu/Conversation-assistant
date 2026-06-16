@@ -139,6 +139,21 @@ def _print_message(msg: dict) -> None:
     tr = msg.get("transcription", {})
     if mtype == "partial_transcript":
         print(f"  [partial] {tr.get('text')}")
+    elif mtype == "prompt_preview":
+        soft = msg.get("soft_segment", {})
+        print(f"  [PREVIEW] {soft.get('text')}  reason={soft.get('reason')}")
+        step = msg.get("prompt_preview")
+        if step:
+            prompts = step.get("prompts", [])
+            print(f"           -> {len(prompts)} provisional prompt(s), "
+                  f"opportunity_count={step.get('opportunity_count')}")
+            for p in prompts:
+                print(f"              · [{p.get('prompt_category')}] "
+                      f"title={p.get('glasses_title')!r} "
+                      f"text={p.get('glasses_text')!r} "
+                      f"surface={p.get('prd_surface')} show={p.get('should_display')}")
+        if msg.get("prompt_preview_error"):
+            print(f"           !! prompt_preview_error: {msg['prompt_preview_error']}")
     elif mtype == "final_transcript":
         print(f"  [FINAL  ] {tr.get('text')}  (conf={tr.get('confidence')})")
         step = msg.get("transcript_step")

@@ -38,7 +38,7 @@ from proactive_assistant.memory.snapshot import (
     _candidate_from_decision,
     _candidate_from_risk,
 )
-from proactive_assistant.orchestration import PromptOrchestrationResult, PromptOrchestrator
+from proactive_assistant.orchestration import PromptCandidate, PromptCandidateStatus, PromptOrchestrationResult, PromptOrchestrator
 from proactive_assistant.prompting import ContentGranularity, PrivacyLevel, PromptCategory, TranscriptWindowItem
 from proactive_assistant.runtime import (
     FeedbackInputChannel,
@@ -58,10 +58,12 @@ from proactive_assistant.runtime import (
 from proactive_assistant.sessions import (
     AssistantSession,
     SessionConfig,
+    SessionContextSnapshot,
     SessionSource,
     SessionService,
     TranscriptSegmentInput,
     TranscriptSegmentRecord,
+    TranscriptWindow,
 )
 
 from proactive_assistant.product.contracts import (
@@ -385,6 +387,82 @@ class ProductAssistantService:
             decisions=decisions,
             opportunity_count=len(orchestration_result.opportunities),
             candidate_count=len(orchestration_result.candidates),
+        )
+
+    def preview_transcript_prompts(
+        self,
+        session_id: str,
+        segment: TranscriptSegmentInput,
+        *,
+        segment_id: str | None = None,
+        max_segments: int = 12,
+        memory_context: list[str] | None = None,
+        memory_refs: list[str] | None = None,
+        use_memory: bool = False,
+        max_prompts: int = 1,
+    ) -> ProductTranscriptStepResult:
+        """Generate provisional prompts from an ASR partial without persistence."""
+
+        session = self.sessions.get_session(session_id)
+        transcript_segment = TranscriptSegmentRecord(
+            **segment.model_dump(mode="python"),
+            session_id=session_id,
+            segment_id=segment_id or f"preview_{sha1(segment.text.encode('utf-8')).hexdigest()[:12]}",
+        )
+        stored_transcript = self.sessions.get_transcript(session_id)
+        recent_segments = [*stored_transcript[-max(max_segments - 1, 0):], transcript_segment]
+        warmup_context = self._warmup_contexts.get(session_id)
+        base_memory_context = _merge_unique(
+            memory_context or [],
+            list(warmup_context.memory_context) if warmup_context and use_memory else [],
+        )
+        base_memory_refs = _merge_unique(
+            memory_refs or [],
+            list(warmup_context.memory_refs) if warmup_context and use_memory else [],
+        )
+        snapshot = SessionContextSnapshot(
+            session_id=session.session_id,
+            scene=session.scene,
+            status=session.status,
+            locale=session.locale,
+            pre_context=session.pre_context,
+            recent_transcript=TranscriptWindow.from_segments(session_id, recent_segments[-max_segments:]),
+            transcript_stats={
+                "segment_count": len(stored_transcript) + 1,
+                "total_chars": sum(len(item.text) for item in stored_transcript) + len(transcript_segment.text),
+                "duration_ms": _transcript_duration_ms(recent_segments),
+                "speaker_count": len({item.speaker for item in recent_segments}),
+                "provisional": True,
+            },
+            privacy_constraints=session.privacy_constraints,
+            memory_context=base_memory_context,
+            memory_refs=base_memory_refs,
+            metadata={**session.metadata, "provisional": True},
+        )
+        opportunities = self.prompt_orchestrator.select_opportunities(snapshot)
+        if max_prompts > 0:
+            opportunities = opportunities[:max_prompts]
+        candidates = [
+            self.prompt_orchestrator.generate_candidate(snapshot, opportunity)
+            for opportunity in opportunities
+        ]
+        return ProductTranscriptStepResult(
+            session=session,
+            transcript_segment=transcript_segment,
+            snapshot=snapshot,
+            meeting_state=self._get_or_create_meeting_state(session_id),
+            meeting_gaps=[],
+            retrieved_memory_context=None,
+            prompts=[
+                prompt_payload_from_candidate(
+                    candidate,
+                    decision_id=f"preview_{candidate.candidate_id}",
+                )
+                for candidate in candidates
+            ],
+            decisions=[],
+            opportunity_count=len(opportunities),
+            candidate_count=len(candidates),
         )
 
     def _auto_snapshot_new_commitments(self, session_id: str, state: MeetingState) -> None:
@@ -1307,6 +1385,60 @@ def prompt_payload_from_decision(decision: PromptDecisionRecord) -> ProductPromp
     )
 
 
+def prompt_payload_from_candidate(candidate: PromptCandidate, *, decision_id: str) -> ProductPromptPayload:
+    result = candidate.prompt_result
+    status = _enum_value(candidate.status)
+    should_display = (
+        status == PromptCandidateStatus.GENERATED.value
+        and result is not None
+        and result.should_prompt
+    )
+    if should_display:
+        display_status = PromptDecisionDisplayStatus.SHOWN
+    elif status == PromptCandidateStatus.GENERATION_FAILED.value:
+        display_status = PromptDecisionDisplayStatus.FAILED
+    else:
+        display_status = PromptDecisionDisplayStatus.SUPPRESSED
+    return ProductPromptPayload(
+        decision_id=decision_id,
+        session_id=candidate.session_id,
+        candidate_id=candidate.candidate_id,
+        opportunity_id=candidate.opportunity.opportunity_id,
+        should_display=should_display,
+        display_status=display_status,
+        prompt_category=(
+            str(_enum_value(result.prompt_category))
+            if result is not None and result.prompt_category is not None
+            else str(_enum_value(candidate.opportunity.prompt_category))
+        ),
+        content_granularity=(
+            result.content_granularity
+            if result is not None
+            else candidate.opportunity.suggested_content_granularity
+        ),
+        prd_surface=candidate.prompt_request.prd_surface,
+        display_mode=candidate.prompt_request.display_mode,
+        duration_policy=candidate.prompt_request.duration_policy,
+        glasses_title=result.glasses_title if result is not None else "",
+        glasses_text=result.glasses_text if result is not None else "",
+        app_detail_text=result.app_detail_text if result is not None else "",
+        source_refs=list(result.source_refs) if result is not None else [],
+        confidence=result.confidence if result is not None else candidate.opportunity.confidence,
+        privacy_level=result.privacy_level if result is not None else candidate.opportunity.privacy_level,
+        privacy_risk=result.privacy_risk if result is not None else candidate.opportunity.privacy_risk,
+        reason=candidate.reason,
+        safety_flags=sorted(
+            set(
+                [
+                    *candidate.opportunity.safety_flags,
+                    *(result.safety_flags if result is not None else []),
+                    "provisional_asr_partial",
+                ]
+            )
+        ),
+    )
+
+
 def _safety_flags(decision: PromptDecisionRecord) -> list[str]:
     flags = list(decision.candidate.opportunity.safety_flags)
     if decision.candidate.prompt_result is not None:
@@ -1344,6 +1476,12 @@ def _optional_int(value: object) -> int | None:
     if isinstance(value, str) and value.isdigit():
         return int(value)
     return None
+
+
+def _transcript_duration_ms(segments: list[TranscriptSegmentRecord]) -> int:
+    if not segments:
+        return 0
+    return max(segment.end_ms for segment in segments) - min(segment.start_ms for segment in segments)
 
 
 def _inline_capture_candidate_id(
